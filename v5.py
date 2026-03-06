@@ -371,6 +371,144 @@ def fetch_vix_history() -> pd.Series:
     except Exception:
         return pd.Series(dtype=float)
 
+@st.cache_data(ttl=60)   # 縮短至 60 秒，確保數據更新更即時
+def fetch_vix_intraday() -> dict:
+    """
+    抓取 VIX 盤中即時數據（1分鐘K線），
+    計算：當日漲跌幅、近期方向動量、與前日收盤比較。
+    """
+    result = {
+        "spot": None, "open_today": None,
+        "chg_from_open": 0, "chg_pct_from_open": 0,
+        "chg_from_prev": 0, "chg_pct_from_prev": 0,
+        "trend_5bar": "flat",
+        "trend_label": "→平穩",
+        "last_bar_time": "",    # 最新一根K線的時間（用於診斷）
+        "signal": 0,
+        "signal_label": "",
+        "signal_color": "#888888",
+        "bars": None,
+        "error": None,
+    }
+    try:
+        res = _yahoo_chart_api("^VIX", "1m", "5d")
+        if res["error"] or res["df"] is None:
+            result["error"] = res.get("error", "VIX 數據失敗")
+            return result
+
+        df = res["df"].dropna()
+        if df.empty:
+            result["error"] = "VIX 無數據"
+            return result
+
+        # 轉換到 ET 時區
+        try:
+            import pytz as _ptz
+            _et = _ptz.timezone("America/New_York")
+            if df.index.tzinfo is None:
+                df = df.tz_localize("UTC").tz_convert(_et)
+            else:
+                df = df.tz_convert(_et)
+        except Exception:
+            pass
+
+        spot = float(df["Close"].iloc[-1])
+        result["spot"] = spot
+        result["bars"] = df
+
+        # 記錄最新一根時間（供 UI 診斷顯示）
+        try:
+            result["last_bar_time"] = df.index[-1].strftime("%m/%d %H:%M ET")
+        except Exception:
+            result["last_bar_time"] = ""
+
+        # 前一交易日收盤：取最後一根「正規盤收盤時段（15:55-16:00）」的數據
+        # 不依賴 date() 比較，改用小時判斷，避免盤後/盤前 date 相同問題
+        try:
+            # 找正規盤的所有K線（09:30-16:00 ET）
+            _h = df.index.hour
+            _m = df.index.minute
+            reg_mask = (
+                ((_h > 9) | ((_h == 9) & (_m >= 30))) &
+                (_h < 16)
+            )
+            reg_bars = df[reg_mask]
+            if len(reg_bars) >= 2:
+                # 最後一個正規盤 session 結束的收盤（前一日）
+                last_reg_date = reg_bars.index[-1].date()
+                prev_reg_bars = reg_bars[reg_bars.index.map(lambda t: t.date()) < last_reg_date]
+                if not prev_reg_bars.empty:
+                    prev_close = float(prev_reg_bars["Close"].iloc[-1])
+                else:
+                    # 當天是第一個正規盤 session，用開盤前第一根作為參考
+                    prev_close = float(reg_bars["Close"].iloc[0])
+                # 當日收盤（最後一根正規盤）
+                today_reg_close = float(reg_bars["Close"].iloc[-1])
+                result["chg_from_prev"]     = today_reg_close - prev_close
+                result["chg_pct_from_prev"] = (today_reg_close - prev_close) / prev_close * 100
+                # spot 可能是盤後價，用 spot 對比前日正規盤收盤
+                result["chg_from_prev"]     = spot - prev_close
+                result["chg_pct_from_prev"] = (spot - prev_close) / prev_close * 100
+        except Exception:
+            # fallback：用 date 比較
+            today = df.index[-1].date()
+            prev_bars_fb = df[df.index.map(lambda t: t.date()) < today]
+            if not prev_bars_fb.empty:
+                prev_close = float(prev_bars_fb["Close"].iloc[-1])
+                result["chg_from_prev"]     = spot - prev_close
+                result["chg_pct_from_prev"] = (spot - prev_close) / prev_close * 100
+
+        # 今日開盤（今日第一根正規盤K線）
+        try:
+            today_date = df.index[-1].date()
+            today_bars = df[df.index.map(lambda t: t.date()) == today_date]
+            if not today_bars.empty:
+                open_today = float(today_bars["Open"].iloc[0])
+                result["open_today"]        = open_today
+                result["chg_from_open"]     = spot - open_today
+                result["chg_pct_from_open"] = (spot - open_today) / open_today * 100
+        except Exception:
+            pass
+
+        # 近15根1分鐘K線方向動量（= 約15分鐘趨勢）
+        if len(df) >= 15:
+            last_n = df["Close"].iloc[-15:]
+            slope = (float(last_n.iloc[-1]) - float(last_n.iloc[0])) / float(last_n.iloc[0]) * 100
+            if slope > 0.8:
+                result["trend_5bar"] = "up"
+            elif slope < -0.8:
+                result["trend_5bar"] = "down"
+            else:
+                result["trend_5bar"] = "flat"
+
+        result["trend_label"] = {"up": "↑上升中", "down": "↓下降中", "flat": "→平穩"}[result["trend_5bar"]]
+
+        # 綜合訊號：VIX漲→股市空，VIX跌→股市多
+        pct = result["chg_pct_from_prev"]
+        t5  = result["trend_5bar"]
+        if pct > 15 or (pct > 8 and t5 == "up"):
+            sig, lbl, col = -4, f"🚨 VIX暴升 {pct:+.1f}% → 極度恐慌，強力看空", "#ff2222"
+        elif pct > 5 or (pct > 2 and t5 == "up"):
+            sig, lbl, col = -2, f"🔴 VIX上升 {pct:+.1f}% → 恐慌升溫，偏空", "#ff6644"
+        elif pct > 0 and t5 == "flat":
+            sig, lbl, col = -1, f"🟡 VIX微升 {pct:+.1f}%，輕微壓力", "#ffaa44"
+        elif pct < -10 or (pct < -5 and t5 == "down"):
+            sig, lbl, col = +3, f"🟢 VIX急跌 {pct:+.1f}% → 恐慌消退，強力看多", "#00ee66"
+        elif pct < -2 or t5 == "down":
+            sig, lbl, col = +2, f"🟢 VIX下降 {pct:+.1f}% → 市場偏多", "#44cc88"
+        else:
+            sig, lbl, col = 0, f"⚪ VIX平穩 {pct:+.1f}%，市場中性", "#888888"
+
+        result["signal"]       = sig
+        result["signal_label"] = lbl
+        result["signal_color"] = col
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 @st.cache_data(ttl=120)
 def fetch_vix_term_structure() -> dict:
     """
@@ -379,29 +517,24 @@ def fetch_vix_term_structure() -> dict:
     - VIX9D 超短期 (^VIX9D) — 9日隱含波動率
     - VIX3M 中期 (^VIX3M) — 3個月
     - VIX6M 長期 (^VIX6M) — 6個月
-    - SPY 期貨替代：用 SPY 當日漲跌幅近似期貨壓力
-
-    回傳 dict with:
-      spot, vix9d, vix3m, vix6m,
-      structure: 'contango' | 'backwardation' | 'flat'
-      panic_type: 'short_term' | 'systemic' | 'normal'
-      interpretation: str (中文解讀)
-      score: float (0=極度恐慌, 100=極度平靜)
+    期限結構類型：Contango（正向，正常）/ Backwardation（反向，恐慌）
     """
     result = {
         "spot": None, "vix9d": None, "vix3m": None, "vix6m": None,
-        "structure": "unknown", "panic_type": "normal",
-        "interpretation": "", "alert": None, "alert_type": "info",
-        "contango_pct": None,
+        "structure": "unknown", "contango_pct": None,
+        "panic_type": "normal", "alert_msg": None,
+        "spy_1d_chg_pct": None, "vix_1d_chg_pct": 0,
+        "source": "none",
     }
 
     def _fetch_last(ticker):
         try:
-            df = yf.download(ticker, period="3d", interval="1d",
+            df = yf.download(ticker, period="5d", interval="1d",
                              auto_adjust=True, progress=False)
+            if df.empty:
+                return None
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            s = df["Close"].dropna()
-            return float(s.iloc[-1]) if not s.empty else None
+            return float(df["Close"].dropna().iloc[-1])
         except Exception:
             return None
 
@@ -409,118 +542,70 @@ def fetch_vix_term_structure() -> dict:
     vix9d = _fetch_last("^VIX9D")
     vix3m = _fetch_last("^VIX3M")
     vix6m = _fetch_last("^VIX6M")
+    spy   = _fetch_last("SPY")
 
-    result.update({"spot": spot, "vix9d": vix9d, "vix3m": vix3m, "vix6m": vix6m})
+    result["spot"]  = spot
+    result["vix9d"] = vix9d
+    result["vix3m"] = vix3m
+    result["vix6m"] = vix6m
 
-    if spot is None or vix3m is None:
-        result["interpretation"] = "期限結構數據不足"
-        return result
-
-    # ── 計算期限結構 ──────────────────────────────────────────────────────
-    # Contango = 正常：遠月 > 近月（市場平靜，未來不確定性溢價）
-    # Backwardation = 警告：近月 > 遠月（當下恐慌 > 未來預期）
-    contango_pct = (vix3m - spot) / spot * 100   # 正 = contango, 負 = backwardation
-
-    if contango_pct > 5:
-        structure = "contango"
-    elif contango_pct < -3:
-        structure = "backwardation"
-    else:
-        structure = "flat"
-
-    result["structure"]    = structure
-    result["contango_pct"] = contango_pct
-
-    # ── VIX 當日變化 ─────────────────────────────────────────────────────
+    # VIX 當日漲跌幅（日K）
     try:
-        vix_df = yf.download("^VIX", period="5d", interval="1d",
-                             auto_adjust=True, progress=False)
-        vix_df.columns = [c[0] if isinstance(c, tuple) else c for c in vix_df.columns]
-        vix_series = vix_df["Close"].dropna()
-        vix_1d_chg_pct = float((vix_series.iloc[-1] - vix_series.iloc[-2])
-                               / vix_series.iloc[-2] * 100) if len(vix_series) >= 2 else 0
+        vix_series = fetch_vix_history()
+        if len(vix_series) >= 2:
+            vix_1d_chg_pct = float((vix_series.iloc[-1] - vix_series.iloc[-2])
+                                   / vix_series.iloc[-2] * 100)
+        else:
+            vix_1d_chg_pct = 0
     except Exception:
         vix_1d_chg_pct = 0
+    result["vix_1d_chg_pct"] = vix_1d_chg_pct
 
-    # ── SPY 日漲跌幅（近似期貨壓力）─────────────────────────────────────
+    # SPY 當日漲跌幅
     try:
         spy_df = yf.download("SPY", period="5d", interval="1d",
                              auto_adjust=True, progress=False)
         spy_df.columns = [c[0] if isinstance(c, tuple) else c for c in spy_df.columns]
         spy_s = spy_df["Close"].dropna()
-        spy_1d_chg_pct = float((spy_s.iloc[-1] - spy_s.iloc[-2])
-                               / spy_s.iloc[-2] * 100) if len(spy_s) >= 2 else 0
+        spy_1d_chg_pct = float((spy_s.iloc[-1] - spy_s.iloc[-2]) / spy_s.iloc[-2] * 100) if len(spy_s) >= 2 else 0
     except Exception:
         spy_1d_chg_pct = 0
+    result["spy_1d_chg_pct"] = spy_1d_chg_pct
 
-    # ── 核心理論判斷 ─────────────────────────────────────────────────────
-    vix_spike  = vix_1d_chg_pct > 15    # VIX 單日暴升 >15%
-    spy_drop   = spy_1d_chg_pct < -1.5  # SPY 下跌 >1.5%（期貨壓力）
-    vix_high   = spot > 25
+    vix_spike  = vix_1d_chg_pct > 15
 
-    if vix_spike and not spy_drop and structure in ("contango", "flat"):
-        # 情境一：VIX 暴升但期貨壓力小 + 仍是 Contango → 短期恐慌底
-        panic_type = "short_term"
-        interpretation = (
-            f"📊 VIX 暴升 +{vix_1d_chg_pct:.1f}% 但 SPY 跌幅有限 ({spy_1d_chg_pct:+.1f}%)"
-            f"，期限結構仍為 Contango（遠月溢價 {contango_pct:+.1f}%）。"
-            f"市場認為「短期嚇一嚇」，非系統性風險。"
-            f"👉 有機會是短期恐慌底，可留意反彈買入機會。"
-        )
-        alert_msg  = f"🟡 短期恐慌底訊號｜VIX 暴升+{vix_1d_chg_pct:.0f}% 但結構 Contango，非系統風險"
-        alert_type = "info"
+    # 期限結構判斷（用 VIX vs VIX3M）
+    if spot and vix3m:
+        if spot > vix3m * 1.05:
+            result["structure"]    = "Backwardation"
+            result["contango_pct"] = (spot - vix3m) / vix3m * 100
+            result["panic_type"]   = "systemic"
+            if vix_spike and spy_1d_chg_pct < -2:
+                result["alert_msg"] = (
+                    f"🚨 VIX 暴升 +{vix_1d_chg_pct:.1f}% 且 SPY 重跌 {spy_1d_chg_pct:+.1f}%"
+                    f"，期限結構反轉（Backwardation），系統性風險警報！"
+                )
+            elif vix_spike:
+                result["alert_msg"] = (
+                    f"🟡 短期恐慌底訊號｜VIX 暴升+{vix_1d_chg_pct:.0f}% 但結構 Contango，非系統風險"
+                )
+        elif spot < vix3m * 0.95:
+            result["structure"]    = "Contango"
+            result["contango_pct"] = (vix3m - spot) / spot * 100
+            result["panic_type"]   = "short_term_fear" if vix_spike else "normal"
+            if vix_spike:
+                result["alert_msg"] = (
+                    f"📊 VIX 暴升 +{vix_1d_chg_pct:.1f}% 但 SPY 跌幅有限 ({spy_1d_chg_pct:+.1f}%)"
+                    f"，Contango 結構完整，可能是短期恐慌底"
+                )
+        else:
+            result["structure"]    = "Flat"
+            result["contango_pct"] = 0
+            result["panic_type"]   = "normal"
 
-    elif vix_spike and spy_drop and structure == "backwardation":
-        # 情境二：VIX + 期貨一起大升 + Backwardation → 真風險
-        panic_type = "systemic"
-        interpretation = (
-            f"🚨 VIX 暴升 +{vix_1d_chg_pct:.1f}% 且 SPY 重跌 {spy_1d_chg_pct:+.1f}%"
-            f"，期限結構出現 Backwardation（近月溢價 {abs(contango_pct):.1f}%）。"
-            f"近月恐慌 > 遠月預期，市場對當前風險定價極高。"
-            f"👉 真風險訊號，可能進入中期調整，建議降低倉位。"
-        )
-        alert_msg  = f"🔴 系統性風險｜VIX Backwardation 出現！近月溢價 {abs(contango_pct):.1f}%，中期調整風險高"
-        alert_type = "bear"
-
-    elif vix_high and structure == "backwardation":
-        # VIX 高位 + Backwardation（即使今天沒有暴升）
-        panic_type = "systemic"
-        interpretation = (
-            f"⚠️ VIX 持續高位 {spot:.1f} 且期限結構 Backwardation（近月溢價 {abs(contango_pct):.1f}%）。"
-            f"市場仍在為當前風險大幅溢價，恐慌尚未消退。"
-            f"👉 中期調整訊號持續，謹慎操作。"
-        )
-        alert_msg  = f"🔴 持續風險｜VIX {spot:.1f} + Backwardation，中期調整未結束"
-        alert_type = "bear"
-
-    elif structure == "contango" and spot < 20:
-        # 完全正常
-        panic_type = "normal"
-        interpretation = (
-            f"✅ VIX {spot:.1f}，期限結構正常 Contango（遠月溢價 +{contango_pct:.1f}%）。"
-            f"市場平靜，無系統性風險訊號。"
-        )
-        alert_msg  = None
-        alert_type = "info"
-
-    else:
-        panic_type = "watch"
-        interpretation = (
-            f"🟡 VIX {spot:.1f}，期限結構 {structure}（近遠月差 {contango_pct:+.1f}%）。"
-            f"保持關注，尚未觸發明確風險訊號。"
-        )
-        alert_msg  = None
-        alert_type = "info"
-
-    result.update({
-        "panic_type":     panic_type,
-        "interpretation": interpretation,
-        "alert":          alert_msg,
-        "alert_type":     alert_type,
-        "vix_1d_chg_pct": vix_1d_chg_pct,
-        "spy_1d_chg_pct": spy_1d_chg_pct,
-    })
+    result["source"] = "yfinance"
     return result
+
 
 def get_vix_regime(vix: float) -> tuple:
     """回傳 (狀態描述, 顏色, 條寬%) """
@@ -1737,6 +1822,12 @@ def render_signal_ai_panel():
 # Telegram
 # ══════════════════════════════════════════════════════════════════════════════
 def send_telegram(msg: str):
+    # 雙重防護：沒有活躍股票時，一律不發送
+    try:
+        if not st.session_state.get("_active_symbols"):
+            return
+    except Exception:
+        return
     try:
         token   = st.secrets["TELEGRAM_BOT_TOKEN"]
         chat_id = st.secrets["TELEGRAM_CHAT_ID"]
@@ -1765,136 +1856,46 @@ def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
 # 延長時段數據（盤前 Pre-market / 盤後 After-hours / 夜盤）
 # ══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=60)
-def fetch_extended_data(symbol: str) -> dict:
+@st.cache_data(ttl=90)   # 延長至 90 秒，減少 429
+def _yahoo_chart_api(symbol: str, interval: str, range_str: str) -> dict:
     """
-    Fetch pre/post/overnight bars via Yahoo Finance chart API.
-    No API key needed. Uses the same endpoint as Yahoo Finance website.
-    Extended hours data available via includePrePost=True parameter.
+    底層 Yahoo Finance Chart API 請求（含盤前盤後）。
+    所有上層函數共享此快取，避免重複請求同一 endpoint。
+    ttl=90 秒：既保持數據新鮮，又不會因頻繁刷新觸發 429。
     """
-    result = {
-        "pre": pd.DataFrame(), "post": pd.DataFrame(),
-        "overnight": pd.DataFrame(), "regular": pd.DataFrame(),
-        "error": None, "reg_close": None,
-        "pre_info": None, "post_info": None,
-        "overnight_info": None, "regular_info": None,
-        "source": "none", "trading_date": "",
+    from urllib.parse import quote as _urlencode
+    # ^ 符號需要 URL encode，否則部分代理會拒絕請求
+    encoded_symbol = _urlencode(symbol, safe="")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/122.0 Safari/537.36",
+        "Accept":   "application/json",
+        "Referer":  "https://finance.yahoo.com",
     }
-
-    def _to_et(df):
-        try:
-            import pytz
-            et = pytz.timezone("America/New_York")
-        except ImportError:
-            import datetime as _dt
-            et = _dt.timezone(_dt.timedelta(hours=-5))
-        if df.index.tzinfo is None:
-            return df.tz_localize("UTC").tz_convert(et)
-        return df.tz_convert(et)
-
-    def _split_sessions(df_et):
-        if df_et.empty:
-            return {k: pd.DataFrame() for k in ["regular","pre","post","overnight","trading_date"]}
-
-        def _reg(d):
-            m = ((df_et.index.date == d) &
-                 ((df_et.index.hour > 9) |
-                  ((df_et.index.hour == 9) & (df_et.index.minute >= 30))) &
-                 (df_et.index.hour < 16))
-            return df_et[m].copy()
-
-        def _pre(d):
-            m = ((df_et.index.date == d) &
-                 (df_et.index.hour >= 4) &
-                 ((df_et.index.hour < 9) |
-                  ((df_et.index.hour == 9) & (df_et.index.minute < 30))))
-            return df_et[m].copy()
-
-        def _post(d):
-            m = ((df_et.index.date == d) &
-                 (df_et.index.hour >= 16) & (df_et.index.hour < 20))
-            return df_et[m].copy()
-
-        def _night(d):
-            import datetime as _dt
-            nd = d + _dt.timedelta(days=1)
-            m = (((df_et.index.date == d)  & (df_et.index.hour >= 20)) |
-                 ((df_et.index.date == nd) & (df_et.index.hour <  4)))
-            return df_et[m].copy()
-
-        # Find most recent day with regular session bars
-        reg_mask = (
-            ((df_et.index.hour > 9) |
-             ((df_et.index.hour == 9) & (df_et.index.minute >= 30))) &
-            (df_et.index.hour < 16)
-        )
-        dates = sorted(set(df_et.index[reg_mask].date), reverse=True)
-        if not dates:
-            return {k: pd.DataFrame() for k in ["regular","pre","post","overnight","trading_date"]}
-
-        d0  = dates[0]
-        reg = _reg(d0)
-        pre = _pre(d0)
-        post  = _post(d0)
-        night = _night(d0)
-        if pre.empty   and len(dates) > 1: pre   = _pre(dates[1])
-        if post.empty  and len(dates) > 1: post  = _post(dates[1])
-        if night.empty and len(dates) > 1: night = _night(dates[1])
-
-        return {"regular": reg, "pre": pre, "post": post,
-                "overnight": night, "trading_date": str(d0)}
-
-    def _summary(sdf, ref=None):
-        if sdf.empty:
-            return None
-        ref  = ref or float(sdf["Close"].iloc[0])
-        last = float(sdf["Close"].iloc[-1])
-        return {
-            "open":   float(sdf["Close"].iloc[0]),
-            "close":  last,
-            "high":   float(sdf["High"].max()),
-            "low":    float(sdf["Low"].min()),
-            "volume": int(sdf["Volume"].sum()),
-            "chg":    last - ref,
-            "pct":    (last - ref) / ref * 100 if ref else 0,
-            "bars":   len(sdf),
-            "date":   str(sdf.index[-1].date()),
-        }
-
-    # ── Yahoo Finance Chart API (no key needed) ───────────────────────────────
-    # Interval 1m with range 5d + includePrePost=True
-    try:
+    # 嘗試 query1，失敗自動 fallback 到 query2
+    for host in ("query1", "query2"):
         url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-            f"?interval=1m&range=5d&includePrePost=true"
+            f"https://{host}.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
+            f"?interval={interval}&range={range_str}&includePrePost=true"
             f"&events=div%2Csplits&corsDomain=finance.yahoo.com"
         )
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/122.0 Safari/537.36",
-            "Accept": "application/json",
-            "Referer": "https://finance.yahoo.com",
-        }
-        resp = requests.get(url, headers=headers, timeout=15)
-
-        if resp.status_code == 200:
-            data   = resp.json()
-            chart  = data.get("chart", {})
-            result_data = chart.get("result", [])
-            if not result_data:
-                err = chart.get("error", {})
-                result["error"] = f"Yahoo 無數據: {err}"
-                return result
-
-            r          = result_data[0]
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 429:
+                return {"error": "Yahoo 請求過於頻繁，請稍後再試", "df": None}
+            if resp.status_code != 200:
+                continue   # 試下一個 host
+            data  = resp.json()
+            r_lst = data.get("chart", {}).get("result", [])
+            if not r_lst:
+                err = data.get("chart", {}).get("error", {})
+                return {"error": f"Yahoo 無數據: {err}", "df": None}
+            r          = r_lst[0]
             timestamps = r.get("timestamp", [])
             quotes     = r.get("indicators", {}).get("quote", [{}])[0]
-
             if not timestamps:
-                result["error"] = "Yahoo 回傳空時間序列"
-                return result
-
+                return {"error": "Yahoo 回傳空時間序列", "df": None}
             df = pd.DataFrame({
                 "Open":   quotes.get("open",   [None]*len(timestamps)),
                 "High":   quotes.get("high",   [None]*len(timestamps)),
@@ -1902,215 +1903,34 @@ def fetch_extended_data(symbol: str) -> dict:
                 "Close":  quotes.get("close",  [None]*len(timestamps)),
                 "Volume": quotes.get("volume", [0]*len(timestamps)),
             }, index=pd.to_datetime(timestamps, unit="s", utc=True))
-
-            df = _to_et(df)
+            try:
+                import pytz as _ptz
+                df = df.tz_convert(_ptz.timezone("America/New_York"))
+            except Exception:
+                pass
             df = df.dropna(subset=["Close"])
             df["Volume"] = df["Volume"].fillna(0).astype(int)
-
-            sessions  = _split_sessions(df)
-            reg       = sessions["regular"]
-            reg_close = float(reg["Close"].iloc[-1]) if not reg.empty else None
-
-            has_ext = not sessions["pre"].empty or not sessions["post"].empty
-            result.update({
-                "pre":            sessions["pre"],
-                "post":           sessions["post"],
-                "overnight":      sessions["overnight"],
-                "regular":        reg,
-                "pre_info":       _summary(sessions["pre"],       reg_close),
-                "post_info":      _summary(sessions["post"],      reg_close),
-                "overnight_info": _summary(sessions["overnight"], reg_close),
-                "regular_info":   _summary(reg),
-                "reg_close":      reg_close,
-                "trading_date":   sessions.get("trading_date", ""),
-                "source":         "Yahoo Finance" + (" (含延長時段)" if has_ext else " (僅正規盤)"),
-            })
-            return result
-
-        elif resp.status_code == 429:
-            result["error"] = "Yahoo 請求過於頻繁，請稍後再試"
-        else:
-            result["error"] = f"Yahoo HTTP {resp.status_code}"
-
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
-
-def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_night: bool):
-    """Render extended session panel with debug info."""
-    if not any([show_pre, show_post, show_night]):
-        return
-
-    with st.spinner("載入延長時段數據..."):
-        ext = fetch_extended_data(symbol)
-
-    # Always show debug expander so user can diagnose issues
-    with st.expander("🔍 延長時段診斷（點擊展開）", expanded=ext.get("error") is not None):
-        if ext.get("error"):
-            st.error(f"錯誤：{ext['error']}")
-        trading_date = ext.get("trading_date", "?")
-        reg = ext.get("regular", pd.DataFrame())
-        pre = ext.get("pre", pd.DataFrame())
-        post = ext.get("post", pd.DataFrame())
-        night = ext.get("overnight", pd.DataFrame())
-        reg_close = ext.get("reg_close")
-        source = ext.get("source", "unknown")
-        src_color = "#00ee66" if "Yahoo" in source else "#ffcc00"
-        st.markdown(f'<span style="color:{src_color};font-size:0.82rem;">● 數據來源：{source}</span>', unsafe_allow_html=True)
-        _rc_str = f"${reg_close:.2f}" if reg_close else "N/A"
-        def _rng(d): return f"{str(d.index[0])[:16]} ~ {str(d.index[-1])[:16]}" if not d.empty else "-"
-        st.markdown(f"""
-**最後交易日：** `{trading_date}` | **正規盤收盤：** `{_rc_str}`
-
-| 時段 | 數據根數 | 時間範圍 |
-|------|---------|---------|
-| 正規盤 | {len(reg)} | {_rng(reg)} |
-| 盤前 | {len(pre)} | {_rng(pre)} |
-| 盤後 | {len(post)} | {_rng(post)} |
-| 夜盤 | {len(night)} | {_rng(night)} |
-""")
-
-    if ext.get("error"):
-        return
-
-    reg_close = ext.get("reg_close")
-    st.markdown(
-        f'<div class="ext-panel">'
-        f'<div class="ext-title">🌙 延長時段 · {ext.get("trading_date","")}</div>',
-        unsafe_allow_html=True)
-
-    # ── 摘要卡片 ─────────────────────────────────────────────────────────────
-    session_cfg = [
-        ("pre",       show_pre,   "盤前 04:00-09:30", "ext-tag-pre"),
-        ("post",      show_post,  "盤後 16:00-20:00", "ext-tag-post"),
-        ("overnight", show_night, "夜盤 20:00-04:00", "ext-tag-night"),
-    ]
-    stat_parts = []
-    for key, enabled, name, tag_cls in session_cfg:
-        if not enabled:
+            df = df.sort_index()
+            return {"error": None, "df": df}
+        except Exception as e:
+            last_err = str(e)
             continue
-        info = ext.get(f"{key}_info")
-        if not info:
-            stat_parts.append(
-                f'<div class="ext-stat-card">'
-                f'<div class="ext-stat-label"><span class="ext-session-tag {tag_cls}">{name}</span></div>'
-                f'<div class="ext-stat-val" style="color:#445566;">無數據</div>'
-                f'</div>'
-            )
-            continue
-        chg_cls = "ext-stat-chg-up" if info["chg"] >= 0 else "ext-stat-chg-dn"
-        arrow   = "▲" if info["chg"] >= 0 else "▼"
-        stat_parts.append(
-            f'<div class="ext-stat-card">'
-            f'<div class="ext-stat-label"><span class="ext-session-tag {tag_cls}">{name}</span></div>'
-            f'<div class="ext-stat-val">${info["close"]:.2f}</div>'
-            f'<div class="{chg_cls}">{arrow} {info["chg"]:+.2f} ({info["pct"]:+.2f}%)</div>'
-            f'<div style="font-size:0.68rem;color:#334455;margin-top:3px;">'
-            f'H:{info["high"]:.2f} L:{info["low"]:.2f} · {info["bars"]}根 · {info.get("date","")}</div>'
-            f'</div>'
-        )
-    if stat_parts:
-        st.markdown('<div class="ext-stat-row">' + "".join(stat_parts) + '</div>',
-                    unsafe_allow_html=True)
+    return {"error": last_err if 'last_err' in dir() else "所有請求均失敗", "df": None}
 
-    # ── K 線圖 ────────────────────────────────────────────────────────────────
-    session_meta = {
-        "regular":   ("正規盤",  "#00cc44", "#ff4444"),
-        "pre":       ("盤前",    "#44aaff", "#aa44ff"),
-        "post":      ("盤後",    "#00aacc", "#cc6600"),
-        "overnight": ("夜盤",    "#00bbbb", "#886600"),
-    }
-    plot_order = [
-        ("overnight", show_night, ext.get("overnight", pd.DataFrame())),
-        ("pre",       show_pre,   ext.get("pre",       pd.DataFrame())),
-        ("regular",   True,       ext.get("regular",   pd.DataFrame())),
-        ("post",      show_post,  ext.get("post",      pd.DataFrame())),
-    ]
 
-    # Collect all timestamps in chronological order for category axis
-    all_frames = []
-    for sess, enabled, df_s in plot_order:
-        if enabled and not df_s.empty:
-            tmp = df_s[["Open","High","Low","Close","Volume"]].copy()
-            tmp["_sess"] = sess
-            all_frames.append(tmp)
-
-    if not all_frames:
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
-
-    combined = pd.concat(all_frames).sort_index()
-    fmt      = "%m/%d %H:%M"
-    # de-duplicate timestamps (just in case)
-    combined = combined[~combined.index.duplicated(keep="last")]
-    xlabels  = [t.strftime(fmt) for t in combined.index]
-
-    fig = go.Figure()
-    for sess, enabled, _ in plot_order:
-        if not enabled:
-            continue
-        mask = combined["_sess"] == sess
-        sub  = combined[mask]
-        if sub.empty:
-            continue
-        xs          = [t.strftime(fmt) for t in sub.index]
-        name_, c_up, c_dn = session_meta[sess]
-        fig.add_trace(go.Candlestick(
-            x=xs,
-            open=sub["Open"], high=sub["High"],
-            low=sub["Low"],   close=sub["Close"],
-            name=name_,
-            increasing_line_color=c_up, increasing_fillcolor=c_up,
-            decreasing_line_color=c_dn, decreasing_fillcolor=c_dn,
-            line=dict(width=1),
-        ))
-
-    if reg_close:
-        fig.add_hline(y=reg_close, line_dash="dot", line_color="rgba(255,204,0,0.4)",
-                      line_width=1,
-                      annotation_text=f"收盤 ${reg_close:.2f}",
-                      annotation_font_color="#ffcc00", annotation_font_size=10)
-
-    step = max(1, len(xlabels) // 12)
-    fig.update_layout(
-        height=340,
-        paper_bgcolor="#0a0e18", plot_bgcolor="#0a0e18",
-        font=dict(color="#aabbcc", size=10),
-        margin=dict(l=0, r=0, t=30, b=0),
-        legend=dict(orientation="h", y=1.08, x=0,
-                    bgcolor="rgba(0,0,0,0)", font_size=10),
-        xaxis=dict(
-            type="category",
-            tickmode="array",
-            tickvals=xlabels[::step],
-            ticktext=xlabels[::step],
-            tickangle=-35,
-            tickfont=dict(size=8, color="#556688"),
-            gridcolor="#151c2e",
-            rangeslider=dict(visible=False),
-        ),
-        yaxis=dict(side="right", gridcolor="#151c2e",
-                   tickfont=dict(size=9, color="#556688")),
-    )
-
-    st.plotly_chart(fig, use_container_width=True,
-                    config={"displayModeBar": True},
-                    key=f"ext_{symbol}")
-
-    st.markdown(
-        '<div style="font-size:0.72rem;color:#445566;display:flex;gap:12px;margin-top:4px;">'
-        '<span style="color:#44aaff">■ 盤前(藍)</span>'
-        '<span style="color:#00cc44">■ 正規↑(綠)</span>'
-        '<span style="color:#ff4444">■ 正規↓(紅)</span>'
-        '<span style="color:#00aacc">■ 盤後(青)</span>'
-        '<span style="color:#00bbbb">■ 夜盤</span>'
-        '</div></div>',
-        unsafe_allow_html=True)
-
-def fetch_data(symbol: str, interval: str) -> pd.DataFrame:
+@st.cache_data(ttl=90)
+def fetch_data(symbol: str, interval: str, prepost: bool = False) -> pd.DataFrame:
     _, period = INTERVAL_MAP[interval]
+
+    # 分鐘級別 + 開啟延長時段 → 共享快取的 Yahoo Chart API
+    if prepost and interval in ("1m", "5m", "15m", "30m"):
+        yf_range = {"1m": "5d", "5m": "5d", "15m": "10d", "30m": "20d"}.get(interval, "5d")
+        result   = _yahoo_chart_api(symbol, interval, yf_range)
+        if result["df"] is not None and not result["df"].empty:
+            return result["df"]
+        # 429 或失敗時 fallback（不再重試，避免加重限流）
+
+    # 標準抓取（日K/週K/月K 或 prepost=False 或 API 失敗 fallback）
     try:
         df = yf.download(symbol, period=period, interval=interval,
                          auto_adjust=True, progress=False)
@@ -2118,6 +1938,7 @@ def fetch_data(symbol: str, interval: str) -> pd.DataFrame:
             return pd.DataFrame()
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         df.dropna(inplace=True)
+        df = df.sort_index()
         return df
     except Exception:
         return pd.DataFrame()
@@ -2177,6 +1998,78 @@ def calc_pivot(df, interval: str = "1d"):
             lows.append((idx[i], float(lo[i])))
 
     return highs, lows
+
+def calc_trendline(df, mode="high", lookback=60, min_points=2):
+    """
+    計算下降趨勢線（mode='high'）或上升趨勢線（mode='low'）。
+    用最近 lookback 根K線的局部高/低點做線性回歸。
+    返回 dict:
+      slope, intercept, r2, current_val,
+      points: [(bar_idx, price), ...],
+      breakout: bool（當前價格是否突破趨勢線）
+      distance_pct: 當前價格距趨勢線的百分比
+    """
+    result = {"slope": None, "intercept": None, "r2": None,
+              "current_val": None, "points": [], "breakout": False,
+              "distance_pct": 0, "valid": False}
+    try:
+        n = min(lookback, len(df))
+        sub = df.iloc[-n:]
+        col = "High" if mode == "high" else "Low"
+        vals = sub[col].values if col in sub.columns else sub["Close"].values
+        price_col = sub["Close"].values
+
+        # 找局部極值點（窗口=3）
+        pts = []
+        for i in range(2, len(vals)-2):
+            if mode == "high":
+                if vals[i] >= max(vals[max(0,i-3):i+1]) and vals[i] >= max(vals[i:min(len(vals),i+4)]):
+                    pts.append((i, float(vals[i])))
+            else:
+                if vals[i] <= min(vals[max(0,i-3):i+1]) and vals[i] <= min(vals[i:min(len(vals),i+4)]):
+                    pts.append((i, float(vals[i])))
+
+        # 合併過近的點（保留更極端的）
+        merged = []
+        for idx, v in pts:
+            if not merged or idx - merged[-1][0] >= 5:
+                merged.append((idx, v))
+            elif (mode == "high" and v > merged[-1][1]) or (mode == "low" and v < merged[-1][1]):
+                merged[-1] = (idx, v)
+
+        if len(merged) < min_points:
+            return result
+
+        # 只用最近的幾個點做回歸（最多5個）
+        use_pts = merged[-5:]
+        xs = [p[0] for p in use_pts]
+        ys = [p[1] for p in use_pts]
+        # 用 numpy polyfit 做線性回歸（不依賴 scipy）
+        coeffs = np.polyfit(xs, ys, 1)
+        slope, intercept = float(coeffs[0]), float(coeffs[1])
+        # 計算 R²
+        ys_pred = [slope*x + intercept for x in xs]
+        ss_res = sum((y-yp)**2 for y,yp in zip(ys,ys_pred))
+        ss_tot = sum((y-sum(ys)/len(ys))**2 for y in ys)
+        r = (1 - ss_res/ss_tot)**0.5 if ss_tot > 0 else 0
+
+        # 當前趨勢線值
+        cur_bar = len(sub) - 1
+        cur_val = slope * cur_bar + intercept
+        cur_price = float(price_col[-1])
+
+        breakout = (cur_price > cur_val) if mode == "high" else (cur_price < cur_val)
+        dist_pct = (cur_price - cur_val) / cur_val * 100
+
+        result.update({
+            "slope": slope, "intercept": intercept, "r2": r**2,
+            "current_val": cur_val, "points": use_pts,
+            "breakout": breakout, "distance_pct": dist_pct,
+            "cur_price": cur_price, "valid": r**2 >= 0.5
+        })
+    except Exception:
+        pass
+    return result
 
 def detect_trend(df) -> str:
     if len(df) < 60: return "盤整"
@@ -2386,6 +2279,14 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     A. 趨勢正在形成  B. 趨勢已確立
     C. 趨勢反轉訊號  D. 原有突破（支撐/阻力）
     """
+    # 防護：symbol 必須在目前活躍監控列表中，否則拒絕執行（防止空輸入時觸發）
+    import re as _re_guard
+    if not symbol or not _re_guard.match(r'^[A-Z\.\-]{1,10}$', str(symbol)):
+        return
+    _active = st.session_state.get("_active_symbols", [])
+    if _active and symbol not in _active:
+        return
+
     if len(df) < 35: return
 
     close  = df["Close"]
@@ -2451,7 +2352,63 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
 
     e30 = calc_ema(close, 30)
 
-    # ── E1. 最早期：MACD 負值底背離 + DIF 斜率轉正（空頭動能衰竭）────────
+    # ── E0. 最最早期：空頭排列低點反彈第一根（箭頭形態）──────────────────
+    # 條件：
+    #   1. 均線仍是空頭排列（EMA5 < EMA20）
+    #   2. 近N根出現明顯低點（比前5根都低）
+    #   3. 當前K線是陽線（開<收）
+    #   4. 收盤開始從低點反彈（比低點高）
+    #   5. 量能相對前幾根開始放大（底部量）
+    if len(close) >= 15:
+        try:
+            _e0_e5  = float(e5.iloc[-1])
+            _e0_e20 = float(e20.iloc[-1])
+            _e0_e5p = float(e5.iloc[-2])
+
+            # 仍是空頭排列（EMA5 < EMA20）
+            _e0_bear_align = _e0_e5 < _e0_e20
+
+            # 當前K線是陽線
+            _e0_open  = float(df["Open"].iloc[-1]) if "Open" in df.columns else float(close.iloc[-1])
+            _e0_price = float(close.iloc[-1])
+            _e0_bull_bar = _e0_price > _e0_open
+
+            # 近10根內有明顯低點（V底）
+            _e0_recent = close.iloc[-10:]
+            _e0_low_idx = int(_e0_recent.values.argmin())
+            _e0_low_val = float(_e0_recent.min())
+            _e0_recovery = (_e0_price - _e0_low_val) / _e0_low_val * 100
+            _e0_v_shape  = _e0_low_idx >= 2 and _e0_low_idx <= 8  # 低點在近期，已反彈
+            _e0_enough_recovery = _e0_recovery > 0.15  # 已反彈至少0.15%
+
+            # EMA5 斜率開始向上（剛止跌）
+            _e0_e5_turning = _e0_e5 >= _e0_e5p  # EMA5 不再下降
+
+            # DIF 斜率轉正（動能轉向）
+            _e0_dif_turn = float(dif.iloc[-1]) > float(dif.iloc[-2])
+
+            # 量能相對前3根放大（底部放量）
+            _e0_vol_now  = float(vol.iloc[-1])
+            _e0_vol_prev = float(vol.iloc[-4:-1].mean()) if len(vol) >= 4 else _e0_vol_now
+            _e0_vol_expand = _e0_vol_now >= _e0_vol_prev * 0.8  # 量能不萎縮即可
+
+            if (_e0_bear_align and _e0_bull_bar and _e0_v_shape
+                    and _e0_enough_recovery and _e0_e5_turning
+                    and _e0_dif_turn and _e0_vol_expand):
+                ck = f"{symbol}|{period_label}|空頭底部反彈|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    _e0_tags = [f"低點{_e0_low_val:.2f}已反彈+{_e0_recovery:.2f}%"]
+                    if _e0_dif_turn: _e0_tags.append("DIF轉向↑")
+                    if _e0_e5_turning: _e0_tags.append("EMA5止跌")
+                    add_alert(symbol, period_label,
+                              f"🟡 【底部反彈初訊】空頭排列中低點反彈第一根陽線"
+                              f"（低點{_e0_low_val:.2f}→現價{_e0_price:.2f}，+{_e0_recovery:.2f}%）"
+                              f"，EMA5止跌＋DIF轉向，均線翻多前最早期入場機會"
+                              f"｜{'＋'.join(_e0_tags)}，注意確認後再加倉！", "bull")
+                    new_signals.append(f"底部反彈初訊+{_e0_recovery:.2f}%")
+        except Exception:
+            pass
     if len(close) >= 20:
         # MACD 深負值後連續3根收縮（對應圖中 MACD 從 -0.48 開始回升）
         hist_neg_shrink = (
@@ -2707,16 +2664,85 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     if len(rsi_series.dropna()) >= 5:
         rsi_now  = float(rsi_series.iloc[-1])
         rsi_prev = float(rsi_series.iloc[-2])
-        # RSI 從超賣區(<30)回升穿越30
+        rsi_3ago = float(rsi_series.iloc[-4]) if len(rsi_series) >= 4 else rsi_prev
+
+        # ── C3b-1. RSI 從超賣穿越30（底部反彈確認）
         if rsi_prev < 30 and rsi_now >= 30:
             add_alert(symbol, period_label,
                       f"🟢 反轉訊號｜RSI 超賣回升穿越30 ({rsi_now:.1f}) 潛在底部反彈", "bull")
             new_signals.append(f"RSI超賣回升{rsi_now:.0f}")
-        # RSI 從超買區(>70)回落穿越70
+
+        # ── C3b-2. RSI 從超買回落穿越70（頂部預警）
         elif rsi_prev > 70 and rsi_now <= 70:
             add_alert(symbol, period_label,
                       f"🔴 反轉訊號｜RSI 超買回落穿越70 ({rsi_now:.1f}) 潛在頂部回撤", "bear")
             new_signals.append(f"RSI超買回落{rsi_now:.0f}")
+
+        # ── C3b-3. RSI 持續在超買區且仍上升（強勢延伸，圖右側74的場景）
+        elif rsi_now > 70 and rsi_prev > 70 and rsi_now > rsi_prev:
+            ck = f"{symbol}|{period_label}|RSI超買強勢延伸|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"🚀 【RSI超買強勢】RSI={rsi_now:.1f} 持續在超買區且仍上升"
+                          f"，強勢趨勢延伸中，不宜輕易做空，但注意高位風險！", "bull")
+                new_signals.append(f"RSI超買強勢延伸{rsi_now:.0f}")
+
+        # ── C3b-4. RSI 持續在超賣區且仍下降（弱勢延伸，繼續下跌）
+        elif rsi_now < 30 and rsi_prev < 30 and rsi_now < rsi_prev:
+            ck = f"{symbol}|{period_label}|RSI超賣弱勢延伸|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"💀 【RSI超賣弱勢】RSI={rsi_now:.1f} 持續在超賣區且仍下降"
+                          f"，弱勢延伸，避免接刀！等待RSI回升再考慮入場。", "bear")
+                new_signals.append(f"RSI超賣弱勢延伸{rsi_now:.0f}")
+
+        # ── C3b-5. RSI 底背離（價格新低但RSI未新低，圖中底部反彈前的最早期訊號）
+        if len(rsi_series.dropna()) >= 20:
+            _rsi20 = rsi_series.dropna().iloc[-20:]
+            _close20 = close.iloc[-20:]
+            # 找兩個低點
+            _rsi_min_idx  = int(_rsi20.values.argmin())
+            _price_min_idx = int(_close20.values.argmin())
+            # 如果價格低點比RSI低點更靠後（更近期），且價格更低但RSI更高 → 底背離
+            if (_price_min_idx > _rsi_min_idx + 2
+                    and float(_close20.iloc[-1]) > float(_close20.iloc[_price_min_idx])  # 已離底
+                    and float(_rsi20.iloc[_price_min_idx]) > float(_rsi20.iloc[_rsi_min_idx]) * 0.98):
+                _rsi_at_bottom = float(_rsi20.iloc[_price_min_idx])
+                _rsi_at_first  = float(_rsi20.iloc[_rsi_min_idx])
+                if _rsi_at_bottom > _rsi_at_first * 1.05:  # RSI底背離確認
+                    ck = f"{symbol}|{period_label}|RSI底背離|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📈 【RSI底背離】價格創新低但RSI未創新低"
+                                  f"（RSI底={_rsi_at_first:.1f}→{_rsi_at_bottom:.1f}）"
+                                  f"，反彈動能醞釀中！", "bull")
+                        new_signals.append(f"RSI底背離")
+
+    # C3c. MACD 從深負值金叉（圖中底部最強反轉訊號）
+    # 普通金叉 vs 深負值金叉：深負值代表空頭積累能量更多，反轉力度更強
+    if len(close) >= 30:
+        _dif_c = float(dif.iloc[-1]); _dea_c = float(dea.iloc[-1])
+        _dif_p = float(dif.iloc[-2]); _dea_p = float(dea.iloc[-2])
+        _golden_cross = _dif_c > _dea_c and _dif_p <= _dea_p
+        if _golden_cross:
+            # 找金叉前的DIF最低點（代表下跌深度）
+            _dif_min = float(dif.iloc[-30:].min())
+            if _dif_min < -0.5:   # 深負值金叉（之前跌很深）
+                ck = f"{symbol}|{period_label}|MACD深谷金叉|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if _dif_min < -1.0:
+                        _depth_lbl = f"極深谷({_dif_min:.3f})"
+                    else:
+                        _depth_lbl = f"深谷({_dif_min:.3f})"
+                    add_alert(symbol, period_label,
+                              f"🔔 【MACD深谷金叉】MACD從{_depth_lbl}完成金叉"
+                              f"（DIF={_dif_c:.3f} 上穿 DEA={_dea_c:.3f}）"
+                              f"，深度越深反轉力度越強，底部反彈確認！", "bull")
+                    new_signals.append(f"MACD深谷金叉{_dif_min:.2f}")
 
     # C4. EMA5/EMA10 黃金/死亡交叉（短線反轉確認）
     if e5.iloc[-1] > e10.iloc[-1] and e5.iloc[-2] <= e10.iloc[-2]:
@@ -2807,7 +2833,994 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                   "⚠️ 頂部預警｜多頭 EMA 排列首次出現破口（趨勢轉弱開始）", "bear")
         new_signals.append("多頭排列破口")
 
-    # ── 有新信號且啟用 AI → 自動觸發 Groq 分析 ─────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # F. 跳空缺口偵測（掃描最近 N 根，捕捉日K/週K/月K 跳空）
+    # ════════════════════════════════════════════════════════════════════════
+    if len(df) >= 5:
+        itvl_key_gap = {v[0]: k for k, v in INTERVAL_MAP.items()}.get(period_label, "1d")
+        is_daily_tf  = itvl_key_gap in ("1d", "1wk", "1mo")
+
+        # 掃描窗口：首次啟動時回掃更多根補抓歷史缺口，之後縮短避免重複
+        # 週K/月K 低頻，首次用較大窗口；之後只掃最新 2-3 根
+        _first_scan_key = f"gap_scanned_{symbol}_{period_label}"
+        if _first_scan_key not in st.session_state:
+            # 首次：日K回掃5根，週K/月K回掃8根（覆蓋近2個月的週K）
+            scan_bars = 8 if itvl_key_gap in ("1wk", "1mo") else 5
+            st.session_state[_first_scan_key] = True
+        else:
+            # 之後：只掃最新 2-3 根（增量更新）
+            scan_bars = 3 if itvl_key_gap in ("1wk", "1mo") else 2
+
+        min_gap_pct       = 0.05 if is_daily_tf else 0.10
+        vol_thresh_surge  = 1.3  if is_daily_tf else 1.5
+        vol_thresh_strong = 1.8  if is_daily_tf else 2.0
+
+        in_bull_trend = float(e5.iloc[-1]) > float(e20.iloc[-1]) > float(e60.iloc[-1])
+        in_bear_trend = float(e5.iloc[-1]) < float(e20.iloc[-1])
+
+        def _bar_date(idx_val):
+            return idx_val.strftime("%Y%m%d") if hasattr(idx_val, "strftime") else str(idx_val)[:10]
+
+        # ── 掃描最近 scan_bars 根 K 線（含當根）─────────────────────────────
+        # 規則：只有最新根（scan_i==1）才真正發出警示和Telegram
+        #       歷史根只靜默記錄到 sent_alerts（防止重啟後重複發送），不發通知
+        for scan_i in range(scan_bars, 0, -1):
+            bar_i      = -scan_i          # 被掃描根（-1=最新）
+            prev_i     = -(scan_i + 1)    # 前一根
+            is_latest  = (scan_i == 1)    # 只有最新根才真正通知
+
+            if abs(prev_i) > len(df): continue
+
+            b_open  = float(opn.iloc[bar_i])
+            b_close = float(close.iloc[bar_i])
+            b_high  = float(high.iloc[bar_i])
+            b_low   = float(low.iloc[bar_i])
+            p_high  = float(high.iloc[prev_i])
+            p_low   = float(low.iloc[prev_i])
+            p_close = float(close.iloc[prev_i])
+            if p_close == 0: continue
+
+            gap_up_sz   = b_open - p_high
+            gap_dn_sz   = p_low  - b_open
+            gap_up_pct  = gap_up_sz / p_close * 100
+            gap_dn_pct  = gap_dn_sz / p_close * 100
+
+            # 計算當時的量能比（用那根K線對應位置的均量）
+            vol_slice   = vol.iloc[:len(vol)+bar_i+1] if bar_i < -1 else vol.iloc[:-1]
+            vol_ma_val  = vol_slice.rolling(10).mean().iloc[-1] if len(vol_slice) >= 3 else vol_slice.mean()
+            if pd.isna(vol_ma_val) or vol_ma_val == 0:
+                vol_ma_val = vol.iloc[bar_i]
+            vol_ratio   = float(vol.iloc[bar_i]) / float(vol_ma_val)
+            vol_surge   = vol_ratio >= vol_thresh_surge
+            vol_strong  = vol_ratio >= vol_thresh_strong
+
+            is_bull_bar = b_close > b_open
+            is_bear_bar = b_close < b_open
+            bar_date    = _bar_date(df.index[bar_i])
+
+            # ── F0. 超級跳空（財報/重大消息級別）───────────────────────────
+            # 條件：跳空幅度 ≥ 5% 且 量能 ≥ 5x，屬於機構強制重新定價
+            _e200 = float(calc_ema(close, 200).iloc[bar_i]) if len(close) >= 200 else None
+            _e20  = float(calc_ema(close, 20).iloc[bar_i])
+            _above_e200 = (_e200 is not None) and (b_open > _e200)
+            _above_e20  = b_open > _e20
+
+            if gap_up_pct >= 5.0 and vol_ratio >= 5.0:
+                ck = f"{symbol}|{period_label}|超級跳空上漲|{bar_date}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if is_latest:
+                        tags = [f"跳空+{gap_up_pct:.1f}%", f"量×{vol_ratio:.0f}"]
+                        if _above_e200: tags.append("突破EMA200長線")
+                        if _above_e20:  tags.append("突破EMA20中線")
+                        if b_close > b_open * 1.02: tags.append("強收陽線")
+                        add_alert(symbol, period_label,
+                                  f"🚀🚀 【財報級跳空】超級跳空上漲 +{gap_up_pct:.1f}%"
+                                  f"（開{b_open:.2f} 前高{p_high:.2f}）"
+                                  f" 量爆×{vol_ratio:.0f}｜{'＋'.join(tags)}"
+                                  f"，可能為財報/重大消息，注意追高風險！", "bull")
+                        new_signals.append(f"超級跳空+{gap_up_pct:.1f}%")
+
+            elif gap_dn_pct >= 5.0 and vol_ratio >= 5.0:
+                ck = f"{symbol}|{period_label}|超級跳空下跌|{bar_date}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if is_latest:
+                        add_alert(symbol, period_label,
+                                  f"💀💀 【財報級跳空】超級跳空下跌 -{gap_dn_pct:.1f}%"
+                                  f"（開{b_open:.2f} 前低{p_low:.2f}）"
+                                  f" 量爆×{vol_ratio:.0f}｜嚴重崩跌，避免接刀！", "bear")
+                        new_signals.append(f"超級跳空下跌{gap_dn_pct:.1f}%")
+
+            # ── F1. 向上跳空 + 放量 ──────────────────────────────────────
+            if gap_up_pct >= min_gap_pct and vol_surge:
+                ck = f"{symbol}|{period_label}|跳空上漲|{bar_date}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if is_latest:   # 只有最新根才發通知
+                        tags = [f"缺口+{gap_up_pct:.2f}%", f"量×{vol_ratio:.1f}"]
+                        if vol_strong:                  tags.append("強放量")
+                        if is_bull_bar:                 tags.append("陽線確認")
+                        if in_bull_trend:               tags.append("多頭趨勢")
+                        if dif.iloc[-1] > dea.iloc[-1]: tags.append("MACD多方")
+                        strength = "🔔 【強烈買入】" if vol_strong and is_bull_bar else "🟢 【買入訊號】"
+                        add_alert(symbol, period_label,
+                                  f"{strength}跳空上漲 +{gap_up_pct:.2f}%"
+                                  f"（開{b_open:.2f} 前高{p_high:.2f}）"
+                                  f" 放量×{vol_ratio:.1f}｜{'＋'.join(tags)}", "bull")
+                        new_signals.append(f"跳空上漲{gap_up_pct:.2f}%")
+
+            # ── F2. 向上跳空無放量 ───────────────────────────────────────
+            elif gap_up_pct >= 0.3 and not vol_surge:
+                ck = f"{symbol}|{period_label}|跳空無量|{bar_date}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if is_latest:
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 跳空上漲 +{gap_up_pct:.2f}%"
+                                  f"（開{b_open:.2f} 前高{p_high:.2f}）"
+                                  f" 量能僅×{vol_ratio:.1f}，注意假突破", "info")
+                        new_signals.append(f"跳空無量{gap_up_pct:.2f}%")
+
+            # ── F3. 向下跳空 + 放量 ──────────────────────────────────────
+            if gap_dn_pct >= min_gap_pct and vol_surge:
+                ck = f"{symbol}|{period_label}|跳空下跌|{bar_date}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if is_latest:
+                        tags = [f"缺口-{gap_dn_pct:.2f}%", f"量×{vol_ratio:.1f}"]
+                        if vol_strong:    tags.append("強放量")
+                        if is_bear_bar:   tags.append("陰線確認")
+                        if in_bear_trend: tags.append("空頭趨勢")
+                        strength = "🔴 【強烈賣出】" if vol_strong and is_bear_bar else "🟠 【賣出訊號】"
+                        add_alert(symbol, period_label,
+                                  f"{strength}跳空下跌 -{gap_dn_pct:.2f}%"
+                                  f"（開{b_open:.2f} 前低{p_low:.2f}）"
+                                  f" 放量×{vol_ratio:.1f}｜{'＋'.join(tags)}", "bear")
+                        new_signals.append(f"跳空下跌{gap_dn_pct:.2f}%")
+
+        # ── F4. 缺口回補測試（固定看最新根）─────────────────────────────────
+        curr_low = float(low.iloc[-1])
+        for lb in range(2, min(15, len(df)-1)):
+            ph_lb = float(high.iloc[-(lb+1)])
+            op_lb = float(opn.iloc[-lb])
+            if op_lb > ph_lb:
+                if ph_lb * 0.993 <= curr_low <= ph_lb * 1.005:
+                    ck = f"{symbol}|{period_label}|缺口回補|{_bar_date(df.index[-1])}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 跳空缺口回補測試｜缺口頂 ${ph_lb:.2f}"
+                                  f"，支撐能否守住是關鍵", "info")
+                        new_signals.append("缺口回補測試")
+                break
+
+        # ── F5. 島形頂部反轉 ─────────────────────────────────────────────────
+        if len(df) >= 3:
+            p_close_f5 = float(close.iloc[-2]) if float(close.iloc[-2]) else 1
+            gap_up_2ago    = float(opn.iloc[-2]) - float(high.iloc[-3])
+            gap_down_today = float(low.iloc[-2]) - float(opn.iloc[-1])
+            if gap_up_2ago > 0 and gap_down_today > 0:
+                ck = f"{symbol}|{period_label}|島形頂部|{_bar_date(df.index[-1])}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"🚨 【島形頂部反轉】連續跳空孤島"
+                              f"（上跳+{gap_up_2ago/p_close_f5*100:.2f}%"
+                              f" 下跳-{gap_down_today/p_close_f5*100:.2f}%）強烈賣出", "bear")
+                    new_signals.append("島形頂部反轉")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # G. 均線極度聚合偵測（最佳交易時機：爆發前的壓縮）
+    # 對應圖片：V型反轉後所有EMA收縮到392-393極小範圍 → 即將方向選擇
+    # ════════════════════════════════════════════════════════════════════════
+    if len(df) >= 20:
+        # 計算所有 EMA 的當前值
+        ema_set = {}
+        for n in [5, 10, 20, 30, 60]:
+            s = calc_ema(close, n)
+            ema_set[n] = float(s.iloc[-1])
+
+        ema_vals_list = list(ema_set.values())
+        ema_max  = max(ema_vals_list)
+        ema_min  = min(ema_vals_list)
+        ema_mean = sum(ema_vals_list) / len(ema_vals_list)
+
+        # 聚合程度：所有EMA的極差相對於均價的百分比
+        compress_pct = (ema_max - ema_min) / ema_mean * 100 if ema_mean else 999
+
+        # 歷史聚合程度（20根前的EMA極差，用來判斷是否在收縮中）
+        ema_set_20ago = {}
+        for n in [5, 10, 20, 30, 60]:
+            s = calc_ema(close, n)
+            if len(s) >= 20:
+                ema_set_20ago[n] = float(s.iloc[-20])
+        if ema_set_20ago:
+            vals_20ago   = list(ema_set_20ago.values())
+            compress_20ago = (max(vals_20ago) - min(vals_20ago)) / (sum(vals_20ago)/len(vals_20ago)) * 100
+        else:
+            compress_20ago = compress_pct
+
+        # 判斷是否在持續收縮（5根前 vs 現在）
+        ema_set_5ago = {}
+        for n in [5, 10, 20, 30, 60]:
+            s = calc_ema(close, n)
+            if len(s) >= 5:
+                ema_set_5ago[n] = float(s.iloc[-5])
+        vals_5ago      = list(ema_set_5ago.values()) if ema_set_5ago else ema_vals_list
+        compress_5ago  = (max(vals_5ago) - min(vals_5ago)) / (sum(vals_5ago)/len(vals_5ago)) * 100
+
+        # 均線排列方向（用 EMA5 vs EMA60 判斷當前偏多/偏空/中性）
+        e5_now  = ema_set[5]
+        e60_now = ema_set[60]
+        bias = "多頭偏向" if e5_now > e60_now * 1.001 else (
+               "空頭偏向" if e5_now < e60_now * 0.999 else "完全中性")
+
+        # 收縮中（20根前擴散→現在收縮）
+        shrinking = compress_pct < compress_20ago * 0.6   # 收縮幅度超過40%
+
+        # ── G1. 極度聚合（最緊繃，隨時爆發）──────────────────────────────
+        # 圖中後半段：所有EMA差距<0.2%，是爆發前最後壓縮
+        if compress_pct < 0.15:
+            # 判斷爆發方向可能性
+            price_vs_ema = (price - ema_mean) / ema_mean * 100
+            direction_hint = ""
+            if price > ema_max:
+                direction_hint = "，價格在均線上方 → 偏多突破"
+            elif price < ema_min:
+                direction_hint = "，價格在均線下方 → 偏空突破"
+            else:
+                direction_hint = "，價格在均線内 → 方向未定"
+
+            ck = f"{symbol}|{period_label}|EMA極度聚合|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"⚡ 【最佳時機】EMA5-60 極度聚合 {compress_pct:.3f}%"
+                          f"（{ema_min:.2f}~{ema_max:.2f}）{direction_hint}"
+                          f"，即將方向性爆發，密切關注！", "info")
+                new_signals.append(f"EMA極度聚合{compress_pct:.3f}%")
+
+        # ── G2. 高度聚合 + 持續收縮（爆發前預警）─────────────────────────
+        elif compress_pct < 0.40 and shrinking:
+            ck = f"{symbol}|{period_label}|EMA高度聚合|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"🔶 【爆發預警】EMA 高度聚合 {compress_pct:.3f}%"
+                          f"（從 {compress_20ago:.2f}% 收縮至 {compress_pct:.2f}%）"
+                          f"，{bias}，注意突破方向", "info")
+                new_signals.append(f"EMA高度聚合{compress_pct:.2f}%")
+
+        # ── G3. 聚合後方向突破（聚合結束，趨勢啟動）──────────────────────
+        # 剛從聚合狀態（5根前聚合）突然擴散（現在擴散）
+        just_exploded = compress_5ago < 0.40 and compress_pct > compress_5ago * 1.8
+
+        if just_exploded:
+            if e5_now > ema_set.get(10, e5_now) > ema_set.get(20, e5_now):
+                ck = f"{symbol}|{period_label}|聚合後多頭突破|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"🚀 【買入時機】均線聚合後多頭方向爆發"
+                              f"（聚合 {compress_5ago:.3f}% → 擴散 {compress_pct:.3f}%）"
+                              f"，趨勢啟動！", "bull")
+                    new_signals.append("聚合後多頭爆發")
+            elif e5_now < ema_set.get(10, e5_now) < ema_set.get(20, e5_now):
+                ck = f"{symbol}|{period_label}|聚合後空頭突破|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"💀 【賣出時機】均線聚合後空頭方向爆發"
+                              f"（聚合 {compress_5ago:.3f}% → 擴散 {compress_pct:.3f}%）"
+                              f"，趨勢下行！", "bear")
+                    new_signals.append("聚合後空頭爆發")
+
+        # ── G4. V型反轉後聚合（最強買入場景）────────────────────────────
+        # 條件：近20根有明顯低點（V底），MACD完成金叉，且均線正在聚合
+        if len(close) >= 20:
+            recent_low_idx  = int(close.iloc[-20:].values.argmin())
+            recent_low_val  = float(close.iloc[-20:].min())
+            recovery_pct    = (price - recent_low_val) / recent_low_val * 100
+            macd_golded     = dif.iloc[-1] > dea.iloc[-1] and dif.iloc[-2] <= dea.iloc[-2]
+            v_shape         = recovery_pct > 1.5 and recent_low_idx < 15  # 低點在中前段，已反彈
+            in_compression  = compress_pct < 0.50
+
+            if v_shape and macd_golded and in_compression:
+                ck = f"{symbol}|{period_label}|V型反轉聚合|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"🔔 【最佳買入】V型反轉後均線聚合"
+                              f"（底部 ${recent_low_val:.2f} 已反彈 +{recovery_pct:.1f}%）"
+                              f" + MACD金叉 + EMA聚合 {compress_pct:.3f}%"
+                              f"，等待突破方向確認後入場！", "bull")
+                    new_signals.append(f"V型反轉聚合+MACD金叉")
+
+        # ── G5. 均線回測再突破（第二次聚合後突破，更可靠）──────────────────
+        # 圖中形態：第一次聚合突破後，均線回縮再次纏繞，然後再度向上發散
+        if len(close) >= 30:
+            try:
+                # 用 EMA5/10/20/30 計算壓縮度（比 EMA60 對短周期更靈敏）
+                _e5h  = calc_ema(close, 5).iloc[-30:]
+                _e10h = calc_ema(close, 10).iloc[-30:]
+                _e20h = calc_ema(close, 20).iloc[-30:]
+                _e30h = calc_ema(close, 30).iloc[-30:]
+                _mean = (_e5h + _e10h + _e20h + _e30h) / 4
+                _compress_g5 = (
+                    (_e5h - _e30h).abs()
+                ) / _mean * 100   # EMA5 vs EMA30 極差 / 均值
+
+                # 閾值依時間週期調整（1分鐘更靈敏，用 0.15%）
+                _tight_thresh = 0.20
+                _tight_mask_g5 = _compress_g5 < _tight_thresh
+                _tight_idx_g5  = [i for i, v in enumerate(_tight_mask_g5) if v]
+
+                if len(_tight_idx_g5) >= 3:
+                    _last_tight  = _tight_idx_g5[-1]
+                    _first_tight = _tight_idx_g5[0]
+                    _tight_dur   = _last_tight - _first_tight
+                    _bars_since  = 29 - _last_tight
+
+                    e5_cur  = float(_e5h.iloc[-1])
+                    e20_cur = float(_e20h.iloc[-1])
+                    e30_cur = float(_e30h.iloc[-1])
+                    comp_cur = float(_compress_g5.iloc[-1])
+
+                    # 多頭回測再突破：壓縮後突破，EMA5 > EMA20 > EMA30
+                    if (_tight_dur >= 3 and _bars_since >= 2
+                            and comp_cur > _tight_thresh * 1.2
+                            and e5_cur > e20_cur > e30_cur
+                            and e5_cur > float(_e5h.iloc[-4])):
+                        ck = f"{symbol}|{period_label}|均線回測再突破|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                        if ck not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(ck)
+                            add_alert(symbol, period_label,
+                                      f"🎯 【回測再突破】均線纏繞({_tight_dur}根 <{_tight_thresh}%)"
+                                      f"→突破後回測→二次向上發散"
+                                      f"（EMA5:{e5_cur:.2f}>EMA20:{e20_cur:.2f}>EMA30:{e30_cur:.2f}）"
+                                      f"，二次突破成功率更高！", "bull")
+                            new_signals.append("均線回測再突破")
+
+                    # 空頭回測再下破
+                    elif (_tight_dur >= 3 and _bars_since >= 2
+                            and comp_cur > _tight_thresh * 1.2
+                            and e5_cur < e20_cur < e30_cur
+                            and e5_cur < float(_e5h.iloc[-4])):
+                        ck = f"{symbol}|{period_label}|均線回測再下破|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                        if ck not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(ck)
+                            add_alert(symbol, period_label,
+                                      f"⚠️ 【回測再下破】均線纏繞({_tight_dur}根)"
+                                      f"→下破後回測→二次向下發散"
+                                      f"（EMA5:{e5_cur:.2f}<EMA20:{e20_cur:.2f}<EMA30:{e30_cur:.2f}）"
+                                      f"，空頭加速！", "bear")
+                            new_signals.append("均線回測再下破")
+            except Exception:
+                pass
+
+        # ── G6. 均線聚合中縮量陰線回測不破（最佳低風險買入點）───────────────
+        # 圖中箭頭形態：
+        #   - 均線已極度壓縮（所有EMA在0.3%以內）
+        #   - 出現一根陰線（小回測）
+        #   - 收盤仍在 EMA20 支撐上方
+        #   - DIF 向上（底背離醞釀）
+        #   - 這根陰線之後 = 低風險買入窗口
+        if len(close) >= 20:
+            try:
+                _g6_e5  = float(calc_ema(close, 5).iloc[-1])
+                _g6_e10 = float(calc_ema(close, 10).iloc[-1])
+                _g6_e20 = float(calc_ema(close, 20).iloc[-1])
+                _g6_e30 = float(calc_ema(close, 30).iloc[-1])
+                _g6_e60 = float(calc_ema(close, 60).iloc[-1])
+                _g6_emas = [_g6_e5, _g6_e10, _g6_e20, _g6_e30, _g6_e60]
+                _g6_mean = sum(_g6_emas) / len(_g6_emas)
+                _g6_spread = (max(_g6_emas) - min(_g6_emas)) / _g6_mean * 100
+
+                _g6_price  = float(close.iloc[-1])
+                _g6_open   = float(df["Open"].iloc[-1]) if "Open" in df.columns else _g6_price
+                _g6_is_bear_bar = _g6_price < _g6_open   # 陰線
+
+                _g6_dif, _g6_dea, _ = calc_macd(close)
+                _g6_dif_now  = float(_g6_dif.iloc[-1])
+                _g6_dif_prev = float(_g6_dif.iloc[-2])
+                _g6_dif_rising = _g6_dif_now > _g6_dif_prev
+
+                # 均線聚合 + 陰線回測 + 不破EMA20支撐 + DIF向上
+                _g6_support_hold = _g6_price > _g6_e20 * 0.9992  # 距EMA20不超過0.08%
+                _g6_above_mid    = _g6_price > _g6_mean * 0.9995 # 仍在均線叢中/上方
+
+                # 前幾根均線方向：至少EMA5在上升趨勢
+                _g6_e5_prev = float(calc_ema(close, 5).iloc[-3])
+                _g6_uptrend = _g6_e5 >= _g6_e5_prev  # EMA5 不是在下降
+
+                if (_g6_spread < 0.30          # 均線高度聚合
+                        and _g6_is_bear_bar     # 這根是陰線
+                        and _g6_support_hold    # 收盤守住EMA20
+                        and _g6_above_mid       # 在均線叢中上方
+                        and _g6_dif_rising      # DIF向上（動能醞釀）
+                        and _g6_uptrend):       # 短期趨勢向上
+
+                    ck = f"{symbol}|{period_label}|聚合縮量回測買點|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        _tag_list = [f"壓縮{_g6_spread:.3f}%", f"EMA20支撐{_g6_e20:.2f}"]
+                        if _g6_dif_now < 0:
+                            _tag_list.append("DIF負值向上↑（底背離醞釀）")
+                        else:
+                            _tag_list.append("DIF正值向上↑")
+                        add_alert(symbol, period_label,
+                                  f"🎯 【聚合回測買點】均線極度壓縮({_g6_spread:.3f}%)"
+                                  f"，陰線回測守住EMA20({_g6_e20:.2f})"
+                                  f"，DIF向上醞釀突破"
+                                  f"｜{'＋'.join(_tag_list)}"
+                                  f"，低風險買入窗口！", "bull")
+                        new_signals.append(f"聚合回測買點{_g6_spread:.3f}%")
+            except Exception:
+                pass
+
+        # ── G7. 長時間盤整後爆量突破（圖中最強形態）──────────────────────────
+        # 條件：
+        #   1. 近N根均線持續壓縮（盤整時間夠長，蓄力越久爆發越猛）
+        #   2. 當根是大陽線（開<收，漲幅明顯）
+        #   3. 量能爆發（×5以上）
+        #   4. 突破前盤整高點
+        if len(close) >= 25:
+            try:
+                _g7_e5  = calc_ema(close, 5)
+                _g7_e20 = calc_ema(close, 20)
+                _g7_e60 = calc_ema(close, 60)
+
+                # 計算過去40根每根的壓縮度
+                _g7_n = min(40, len(close)-2)
+                _g7_compress_hist = []
+                for _j in range(-_g7_n-1, -1):
+                    _e5j  = float(_g7_e5.iloc[_j])
+                    _e20j = float(_g7_e20.iloc[_j])
+                    _e60j = float(_g7_e60.iloc[_j])
+                    _mj   = (_e5j+_e20j+_e60j)/3
+                    _g7_compress_hist.append((max(_e5j,_e20j,_e60j)-min(_e5j,_e20j,_e60j))/_mj*100)
+
+                # 盤整持續根數（壓縮 < 0.5%）
+                _g7_tight_bars = sum(1 for c in _g7_compress_hist if c < 0.5)
+                _g7_tight_pct  = _g7_tight_bars / len(_g7_compress_hist) if _g7_compress_hist else 0
+
+                # 當根是大陽線
+                _g7_price = float(close.iloc[-1])
+                _g7_open  = float(df["Open"].iloc[-1]) if "Open" in df.columns else _g7_price
+                _g7_bar_pct = (_g7_price - _g7_open) / _g7_open * 100
+                _g7_bull_bar = _g7_bar_pct > 0.2  # 漲幅>0.2%
+
+                # 量能爆發
+                _g7_vol_now  = float(vol.iloc[-1])
+                _g7_vol_ma20 = float(vol.rolling(20).mean().iloc[-1]) if len(vol) >= 20 else _g7_vol_now
+                _g7_vol_x    = _g7_vol_now / _g7_vol_ma20 if _g7_vol_ma20 > 0 else 1
+
+                # 突破盤整高點
+                _g7_range_high = float(close.iloc[-_g7_n-1:-1].max())
+                _g7_breakout   = _g7_price > _g7_range_high * 1.001
+
+                # 當前均線壓縮度（確認是從聚合直接突破，不是早就分散了）
+                _g7_cur_compress = _g7_compress_hist[-1] if _g7_compress_hist else 999
+
+                if (_g7_tight_pct >= 0.6        # 60%以上根數都在盤整
+                        and _g7_tight_bars >= 15 # 至少盤整15根
+                        and _g7_bull_bar         # 大陽線
+                        and _g7_vol_x >= 5.0     # 量能×5以上
+                        and _g7_breakout):        # 突破盤整高點
+
+                    ck = f"{symbol}|{period_label}|長盤整爆量突破|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        # 依盤整時間和量能評級
+                        if _g7_tight_bars >= 40 and _g7_vol_x >= 8:
+                            _g7_grade = "🚀🚀 極強"
+                        elif _g7_tight_bars >= 25 or _g7_vol_x >= 8:
+                            _g7_grade = "🚀 強力"
+                        else:
+                            _g7_grade = "⚡ 有效"
+                        add_alert(symbol, period_label,
+                                  f"{_g7_grade}【長盤整爆量突破】"
+                                  f"盤整{_g7_tight_bars}根後大陽線突破（漲{_g7_bar_pct:+.2f}%）"
+                                  f"，量爆×{_g7_vol_x:.1f}（{_g7_vol_now/10000:.0f}萬）"
+                                  f"，突破盤整高點{_g7_range_high:.2f}"
+                                  f"，蓄力越久爆發越猛，趨勢啟動！", "bull")
+                        new_signals.append(f"長盤整×{_g7_tight_bars}爆量×{_g7_vol_x:.0f}突破")
+
+                # 空頭版：長盤整後放量跌破
+                elif (_g7_tight_pct >= 0.6 and _g7_tight_bars >= 15
+                        and _g7_bar_pct < -0.2 and _g7_vol_x >= 5.0
+                        and _g7_price < float(close.iloc[-_g7_n-1:-1].min()) * 0.999):
+                    ck = f"{symbol}|{period_label}|長盤整爆量跌破|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"💀 【長盤整爆量跌破】盤整{_g7_tight_bars}根後放量下破"
+                                  f"（跌{_g7_bar_pct:.2f}%，量×{_g7_vol_x:.1f}）"
+                                  f"，空頭方向確認，注意下行風險！", "bear")
+                        new_signals.append(f"長盤整×{_g7_tight_bars}爆量跌破")
+
+            except Exception:
+                pass
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        _e5   = float(calc_ema(close, 5).iloc[-1])
+        _e10  = float(calc_ema(close, 10).iloc[-1])
+        _e20  = float(calc_ema(close, 20).iloc[-1])
+        _e30  = float(calc_ema(close, 30).iloc[-1])
+        _e60  = float(calc_ema(close, 60).iloc[-1])
+        _price = float(close.iloc[-1])
+
+        # 均線多頭排列：EMA5 > EMA10 > EMA20 > EMA30，且全部朝上
+        _bull_align = (_e5 > _e10 > _e20 > _e30)
+        _bear_align = (_e5 < _e10 < _e20 < _e30)
+
+        # 量能計算：當前量 vs 近20根均量
+        _vol_now  = float(vol.iloc[-1])
+        _vol_ma20 = float(vol.rolling(20).mean().iloc[-1]) if len(vol) >= 20 else _vol_now
+        _vol_x    = _vol_now / _vol_ma20 if _vol_ma20 > 0 else 1
+
+        # 量能從低迷到爆發：近5根均量 vs 近20根均量，判斷是否突然放量
+        _vol_ma5_now  = float(vol.iloc[-5:].mean()) if len(vol) >= 5 else _vol_now
+        _vol_quiet    = _vol_ma5_now < _vol_ma20 * 0.7   # 近期量能低迷
+        _vol_prev_low = float(vol.iloc[-6:-1].mean()) if len(vol) >= 6 else _vol_ma20
+        _vol_surge_x  = _vol_now / _vol_prev_low if _vol_prev_low > 0 else 1
+
+        # ── H1. 量能暴增 + 多頭排列（趨勢加速上漲）────────────────────────
+        if _bull_align and _vol_x >= 3.0 and _price > _e5:
+            ck = f"{symbol}|{period_label}|量能爆發多頭|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                _surge_desc = f"量×{_vol_x:.1f}（前均量{_vol_ma20/10000:.0f}萬→當前{_vol_now/10000:.0f}萬）"
+                if _vol_x >= 8.0:
+                    _h1_prefix = "🚀🔥 【極端爆量·多頭加速】"
+                    _h1_suffix = f"量能達均量×{_vol_x:.0f}，屬機構性掃單！"
+                elif _vol_x >= 5.0:
+                    _h1_prefix = "🔥🔥 【超級爆量·多頭加速】"
+                    _h1_suffix = f"量能達均量×{_vol_x:.0f}，強力追漲。"
+                else:
+                    _h1_prefix = "🔥 【量能爆發·多頭加速】"
+                    _h1_suffix = "趨勢加速上漲！"
+                add_alert(symbol, period_label,
+                          f"{_h1_prefix}EMA5>{_e5:.2f}>EMA10>EMA20>EMA30 完整多頭排列"
+                          f"，{_surge_desc}，{_h1_suffix}", "bull")
+                new_signals.append(f"量爆×{_vol_x:.1f}多頭排列")
+
+        # ── H2. 低迷量後突然爆量 + 均線突破（圖中 18:50 底部反彈場景）───
+        elif _vol_surge_x >= 4.0 and _price > _e20 and _e5 > _e20:
+            ck = f"{symbol}|{period_label}|低迷後爆量突破|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"⚡ 【低迷後爆量突破】量能靜止後突然暴增×{_vol_surge_x:.1f}"
+                          f"，價格突破EMA20（{_e20:.2f}），EMA5>{_e5:.2f}>EMA20，注意追漲！", "bull")
+                new_signals.append(f"低迷後爆量×{_vol_surge_x:.1f}")
+
+        # ── H3. 量能爆發 + 空頭排列（趨勢加速下跌）────────────────────────
+        elif _bear_align and _vol_x >= 3.0 and _price < _e5:
+            ck = f"{symbol}|{period_label}|量能爆發空頭|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"💀 【量能爆發·空頭加速】EMA5<EMA10<EMA20<EMA30 完整空頭排列"
+                          f"，量×{_vol_x:.1f}，趨勢加速下跌，避免接刀！", "bear")
+                new_signals.append(f"量爆×{_vol_x:.1f}空頭排列")
+
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # I. MACD 背離偵測（底背離/頂背離）
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        # 依時間週期動態調整窗口：日K兩個頂可能相距60根，分鐘級40根就夠
+        _i_window = 80 if any(x in period_label for x in ["日","1d","wk","mo","月","週","季","年"]) else 40
+        _i_since_max = 40 if any(x in period_label for x in ["日","1d","wk","mo","月","週","季","年"]) else 20
+
+        if len(close) >= _i_window // 2:
+            _dif_i, _dea_i, _ = calc_macd(close)
+            _n = min(_i_window, len(close))
+            _cN   = close.iloc[-_n:]
+            _difN = _dif_i.iloc[-_n:]
+
+            def _find_lows(series):
+                vals = list(series.values)
+                lows = []
+                for i in range(2, len(vals)-2):
+                    if vals[i] < vals[i-1] and vals[i] < vals[i-2] and \
+                       vals[i] < vals[i+1] and vals[i] < vals[i+2]:
+                        lows.append(i)
+                merged = []
+                for idx in lows:
+                    if not merged or idx - merged[-1] > 5:
+                        merged.append(idx)
+                    elif vals[idx] < vals[merged[-1]]:
+                        merged[-1] = idx
+                return merged[-2:] if len(merged) >= 2 else []
+
+            def _find_highs(series):
+                vals = list(series.values)
+                highs = []
+                for i in range(2, len(vals)-2):
+                    if vals[i] > vals[i-1] and vals[i] > vals[i-2] and \
+                       vals[i] > vals[i+1] and vals[i] > vals[i+2]:
+                        highs.append(i)
+                merged = []
+                for idx in highs:
+                    if not merged or idx - merged[-1] > 5:
+                        merged.append(idx)
+                    elif vals[idx] > vals[merged[-1]]:
+                        merged[-1] = idx
+                return merged[-2:] if len(merged) >= 2 else []
+
+            # ── I1. MACD 底背離 ──────────────────────────────────────────────
+            _pl = _find_lows(_cN)
+            if len(_pl) >= 2:
+                _p1 = float(_cN.iloc[_pl[-2]]); _p2 = float(_cN.iloc[_pl[-1]])
+                _d1 = float(_difN.iloc[_pl[-2]]); _d2 = float(_difN.iloc[_pl[-1]])
+                _since = (_n-1) - _pl[-1]
+                _dif_rising = float(_dif_i.iloc[-1]) > float(_dif_i.iloc[-1-min(3,len(_dif_i)-1)])
+                if (_p2 < _p1*0.9995 and _d2 > _d1*1.01 and _dif_rising and _since <= _i_since_max):
+                    ck = f"{symbol}|{period_label}|MACD底背離|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📈 【MACD底背離】價格創新低({_p1:.2f}→{_p2:.2f})"
+                                  f" 但DIF未創新低({_d1:.3f}→{_d2:.3f})"
+                                  f"，空頭動能衰竭，可能即將反彈！", "bull")
+                        new_signals.append("MACD底背離")
+
+            # ── I2. MACD 頂背離 ──────────────────────────────────────────────
+            _ph = _find_highs(_cN)
+            if len(_ph) >= 2:
+                _p1 = float(_cN.iloc[_ph[-2]]); _p2 = float(_cN.iloc[_ph[-1]])
+                _d1 = float(_difN.iloc[_ph[-2]]); _d2 = float(_difN.iloc[_ph[-1]])
+                _since = (_n-1) - _ph[-1]
+                _dif_falling = float(_dif_i.iloc[-1]) < float(_dif_i.iloc[-1-min(3,len(_dif_i)-1)])
+                # 頂背離強度：DIF差距越大越可靠
+                _div_strength = (_d1 - _d2) / abs(_d1) * 100 if _d1 != 0 else 0
+                if (_p2 > _p1*1.0005 and _d2 < _d1*0.99 and _dif_falling and _since <= _i_since_max):
+                    ck = f"{symbol}|{period_label}|MACD頂背離|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        if _div_strength > 50:
+                            _div_grade = "🚨 極強頂背離"
+                        elif _div_strength > 25:
+                            _div_grade = "⚠️ 強頂背離"
+                        else:
+                            _div_grade = "📉 頂背離"
+                        add_alert(symbol, period_label,
+                                  f"{_div_grade}｜價格創新高({_p1:.2f}→{_p2:.2f}，+{(_p2-_p1)/_p1*100:.1f}%)"
+                                  f" 但DIF大幅衰退({_d1:.2f}→{_d2:.2f}，-{_div_strength:.0f}%)"
+                                  f"，多頭動能嚴重衰竭，頂部反轉風險極高！", "bear")
+                        new_signals.append(f"MACD頂背離DIF衰退{_div_strength:.0f}%")
+
+            # ── I3. 絕對高點背離（圖中最典型：498創新高但DIF遠低於歷史峰值）──
+            # 適用於跨週期頂背離：用全局DIF峰值比較，不依賴局部高點匹配
+            if len(close) >= 30:
+                _dif_all_max = float(_dif_i.iloc[:-5].max())   # 歷史DIF峰值（排除最近5根）
+                _dif_cur     = float(_dif_i.iloc[-1])
+                _price_cur   = float(close.iloc[-1])
+                _price_max_n = float(close.iloc[-_n:].max())   # 近N根價格最高
+                _dif_at_peak_bar = int(_dif_i.iloc[:-5].values.argmax())  # DIF峰值所在的bar
+                _price_at_dif_peak = float(close.iloc[_dif_at_peak_bar])  # DIF峰值時的價格
+
+                # 條件：當前價格接近歷史最高，但DIF遠低於歷史峰值
+                _price_near_high  = _price_cur >= _price_max_n * 0.85    # 在最高點85%以內（放寬）
+                _dif_far_below    = _dif_cur < _dif_all_max * 0.60       # DIF不足峰值60%
+                _dif_declining    = _dif_cur < float(_dif_i.iloc[-5])    # DIF仍在下降
+                _dif_was_positive = _dif_all_max > 1.0                   # 確認有過明顯升浪
+
+                if (_price_near_high and _dif_far_below
+                        and _dif_declining and _dif_was_positive):
+                    _decay_pct = (1 - _dif_cur / _dif_all_max) * 100
+                    ck = f"{symbol}|{period_label}|MACD絕對頂背離|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        if _decay_pct > 70:
+                            _i3_grade = "🚨 極端頂背離"
+                        elif _decay_pct > 50:
+                            _i3_grade = "⚠️ 嚴重頂背離"
+                        else:
+                            _i3_grade = "📉 頂背離"
+                        add_alert(symbol, period_label,
+                                  f"{_i3_grade}｜價格在高位({_price_cur:.2f}，近高{_price_max_n:.2f}的{_price_cur/_price_max_n*100:.0f}%)"
+                                  f" 但DIF僅剩歷史峰值的{100-_decay_pct:.0f}%"
+                                  f"（峰值DIF={_dif_all_max:.2f}→當前={_dif_cur:.2f}，衰退{_decay_pct:.0f}%）"
+                                  f"，多頭動能嚴重透支，大頂風險極高！", "bear")
+                        new_signals.append(f"絕對頂背離DIF僅剩{100-_decay_pct:.0f}%")
+
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # J. MACD Histogram 動能衰竭偵測
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        if len(close) >= 15:
+            _dif_j, _dea_j, _hist_j = calc_macd(close)
+            _hn  = float(_hist_j.iloc[-1])
+            _hp  = float(_hist_j.iloc[-2])
+            _h3  = float(_hist_j.iloc[-4])
+            _s5  = (float(close.iloc[-1]) - float(close.iloc[-5])) / float(close.iloc[-5]) * 100
+            _dif_now = float(_dif_j.iloc[-1])
+
+            # ── J1. 多頭動能衰竭 ─────────────────────────────────────────────
+            if (_hn > 0 and _hp > 0 and abs(_hn) < abs(_hp) < abs(_h3)
+                    and _s5 < 0.1 and _dif_now > 0):
+                ck = f"{symbol}|{period_label}|多頭動能衰竭|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"⚠️ 【多頭動能衰竭】Histogram連縮({_h3:.3f}→{_hp:.3f}→{_hn:.3f})"
+                              f"，上漲動能減弱，注意高位風險！", "bear")
+                    new_signals.append("多頭動能衰竭")
+
+            # ── J2. 空頭動能衰竭 ─────────────────────────────────────────────
+            elif (_hn < 0 and _hp < 0 and abs(_hn) < abs(_hp) < abs(_h3)
+                    and _s5 > -0.1 and _dif_now < 0):
+                ck = f"{symbol}|{period_label}|空頭動能衰竭|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"💡 【空頭動能衰竭】Histogram絕對值連縮({_h3:.3f}→{_hp:.3f}→{_hn:.3f})"
+                              f"，下跌動能減弱，可能即將止跌反彈！", "bull")
+                    new_signals.append("空頭動能衰竭")
+
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # K. 趨勢線突破 + 水平支撐/阻力偵測（日K圖三點下降壓力線場景）
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        if len(df) >= 20:
+            _k_close = df["Close"]
+            _k_price = float(_k_close.iloc[-1])
+
+            # ── K1. 下降趨勢線突破（由空轉多的關鍵訊號）────────────────────
+            _tl_down = calc_trendline(df, mode="high", lookback=min(80, len(df)), min_points=2)
+            if _tl_down and _tl_down["valid"]:
+                _tl_val  = _tl_down["current_val"]
+                _tl_dist = _tl_down["distance_pct"]
+                _tl_r2   = _tl_down["r2"]
+                _tl_slope= _tl_down["slope"]
+                _tl_pts  = len(_tl_down["points"])
+
+                # 突破下降趨勢線（上方 0~3%）
+                if _tl_down["breakout"] and 0 < _tl_dist < 3.0:
+                    ck = f"{symbol}|{period_label}|下降趨勢線突破|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        _slope_str = f"{_tl_slope*5:.2f}/週" if "日" in period_label or "1d" in period_label else f"{_tl_slope:.3f}/根"
+                        add_alert(symbol, period_label,
+                                  f"🚀 【趨勢線突破】突破{_tl_pts}點下降壓力線"
+                                  f"（趨勢線={_tl_val:.2f}，當前={_k_price:.2f}，距離+{_tl_dist:.2f}%）"
+                                  f"，斜率{_slope_str}，R²={_tl_r2:.2f}"
+                                  f"，空頭格局可能終結，注意量能確認！", "bull")
+                        new_signals.append(f"下降趨勢線突破+{_tl_dist:.2f}%")
+
+                # 接近下降趨勢線壓力（上方 -1% 到 0）
+                elif not _tl_down["breakout"] and -1.5 < _tl_dist < 0:
+                    ck = f"{symbol}|{period_label}|接近下降趨勢線|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 【趨勢線壓力】接近{_tl_pts}點下降壓力線"
+                                  f"（趨勢線={_tl_val:.2f}，當前={_k_price:.2f}，距{abs(_tl_dist):.2f}%）"
+                                  f"，注意阻力，突破前謹慎追漲！", "bear")
+                        new_signals.append(f"接近下降趨勢線{_tl_dist:.2f}%")
+
+            # ── K2. 上升趨勢線跌破（由多轉空的關鍵訊號）────────────────────
+            _tl_up = calc_trendline(df, mode="low", lookback=min(80, len(df)), min_points=2)
+            if _tl_up and _tl_up["valid"]:
+                _tlu_val  = _tl_up["current_val"]
+                _tlu_dist = _tl_up["distance_pct"]
+                _tlu_pts  = len(_tl_up["points"])
+
+                if _tl_up["breakout"] and -3.0 < _tlu_dist < 0:
+                    ck = f"{symbol}|{period_label}|上升趨勢線跌破|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"💀 【趨勢線跌破】跌破{_tlu_pts}點上升支撐線"
+                                  f"（趨勢線={_tlu_val:.2f}，當前={_k_price:.2f}，{_tlu_dist:.2f}%）"
+                                  f"，多頭格局破壞，注意下行風險！", "bear")
+                        new_signals.append(f"上升趨勢線跌破{_tlu_dist:.2f}%")
+
+            # ── K3. 水平支撐反彈（多次測試後反彈，圖中390-395支撐帶）────────
+            if len(_k_close) >= 30:
+                # 找近30根的支撐帶（多次觸及的水平區間）
+                _k_lows = sorted([float(_k_close.iloc[i]) for i in range(-30, 0)])
+                _k_support_zone_low  = np.percentile(_k_lows, 8)   # 最低8%分位
+                _k_support_zone_high = np.percentile(_k_lows, 18)  # 最低18%分位
+
+                # 近期觸及支撐帶（近10根有碰到）
+                _k_recent_lows = [float(df["Low"].iloc[i]) if "Low" in df.columns
+                                  else float(_k_close.iloc[i]) for i in range(-10, 0)]
+                _k_touched_support = any(_k_support_zone_low * 0.995 <= l <= _k_support_zone_high * 1.01
+                                         for l in _k_recent_lows)
+                # 當前價格在支撐帶上方反彈（至少1%）
+                _k_rebounded = _k_price > _k_support_zone_high * 1.01
+
+                if _k_touched_support and _k_rebounded:
+                    _k_touch_count = sum(1 for l in _k_recent_lows
+                                         if _k_support_zone_low * 0.995 <= l <= _k_support_zone_high * 1.02)
+                    ck = f"{symbol}|{period_label}|支撐帶反彈|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📈 【支撐帶反彈】{_k_touch_count}次測試支撐帶"
+                                  f"（{_k_support_zone_low:.2f}-{_k_support_zone_high:.2f}）後反彈"
+                                  f"，當前={_k_price:.2f}"
+                                  f"，支撐有效！可考慮逢低做多。", "bull")
+                        new_signals.append(f"支撐帶反彈×{_k_touch_count}")
+
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # L. 箱體突破偵測（長期橫盤後向上/向下突破阻力/支撐）
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        if len(df) >= 25:
+            _l_close = df["Close"]
+            _l_price = float(_l_close.iloc[-1])
+
+            def _calc_box(series, window=20, exclude_recent=3):
+                base = series.iloc[-(window + exclude_recent):-exclude_recent]
+                if len(base) < 5: return None
+                hi = float(base.max()); lo = float(base.min()); mid = float(base.mean())
+                return {"high": hi, "low": lo, "mid": mid,
+                        "range_pct": (hi-lo)/mid*100, "bars": len(base)}
+
+            # 找最緊的盤整窗口
+            _best_box = None
+            for _w in [10, 15, 20, 25]:
+                _box = _calc_box(_l_close, window=_w)
+                if _box and _box["range_pct"] < 1.8:
+                    if _best_box is None or _box["range_pct"] < _best_box["range_pct"]:
+                        _best_box = _box; _best_box["window"] = _w
+
+            if _best_box:
+                _bhi = _best_box["high"]; _blo = _best_box["low"]
+                _brng = _best_box["range_pct"]; _bw = _best_box["window"]
+
+                _l_vol_now = float(vol.iloc[-1])
+                _l_vol_ma  = float(vol.iloc[-10:-1].mean()) if len(vol) >= 11 else _l_vol_now
+                _l_vol_x   = _l_vol_now / _l_vol_ma if _l_vol_ma > 0 else 1
+
+                _le5 = float(calc_ema(_l_close, 5).iloc[-1])
+                _le10= float(calc_ema(_l_close, 10).iloc[-1])
+                _le20= float(calc_ema(_l_close, 20).iloc[-1])
+                _le30= float(calc_ema(_l_close, 30).iloc[-1])
+                _l_bull_align = _le5 > _le10 > _le20 > _le30
+                _l_bear_align = _le5 < _le10 < _le20 < _le30
+
+                _ldif, _ldea, _ = calc_macd(_l_close)
+                _l_dif_above = float(_ldif.iloc[-1]) > float(_ldea.iloc[-1])
+                _l_dif_below = float(_ldif.iloc[-1]) < float(_ldea.iloc[-1])
+
+                _l_break_up_pct = (_l_price - _bhi) / _bhi * 100
+                _l_break_dn_pct = (_l_price - _blo) / _blo * 100
+
+                # ── L1. 向上突破箱體 ─────────────────────────────────────────
+                if (_l_price > _bhi * 1.003 and _l_break_up_pct < 5.0
+                        and _l_vol_x >= 1.5 and _l_bull_align and _l_dif_above):
+                    ck = f"{symbol}|{period_label}|箱體向上突破|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        _pfx = "🚀🚀 【超強" if _l_vol_x >= 5 else "🚀 【"
+                        add_alert(symbol, period_label,
+                                  f"{_pfx}箱體向上突破】橫盤{_bw}根"
+                                  f"（箱頂{_bhi:.2f}，波動{_brng:.3f}%）"
+                                  f"→ 放量×{_l_vol_x:.1f}突破至{_l_price:.2f}（+{_l_break_up_pct:.2f}%）"
+                                  f"，均線多頭排列＋MACD翻正，阻力轉支撐，可積極追進！", "bull")
+                        new_signals.append(f"箱體突破+{_l_break_up_pct:.2f}%×{_l_vol_x:.0f}倍量")
+
+                # ── L2. 向下跌破箱體 ─────────────────────────────────────────
+                elif (_l_price < _blo * 0.997 and _l_break_dn_pct > -5.0
+                        and _l_vol_x >= 1.5 and _l_bear_align and _l_dif_below):
+                    ck = f"{symbol}|{period_label}|箱體向下跌破|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"💀 【箱體向下跌破】橫盤{_bw}根"
+                                  f"（箱底{_blo:.2f}，波動{_brng:.3f}%）"
+                                  f"→ 放量×{_l_vol_x:.1f}跌破至{_l_price:.2f}（{_l_break_dn_pct:.2f}%）"
+                                  f"，均線空頭排列＋MACD翻負，支撐轉阻力！", "bear")
+                        new_signals.append(f"箱體跌破{_l_break_dn_pct:.2f}%×{_l_vol_x:.0f}倍量")
+
+                # ── L3. 超長橫盤蓄勢預警 ─────────────────────────────────────
+                elif _brng < 0.4 and _bw >= 12:
+                    ck = f"{symbol}|{period_label}|超長橫盤預警|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"⏳ 【蓄勢待發】橫盤已{_bw}根，波動僅{_brng:.3f}%"
+                                  f"（{_blo:.2f}-{_bhi:.2f}）"
+                                  f"，能量極度壓縮，隨時可能方向性突破，密切監控！", "bull")
+                        new_signals.append(f"超長橫盤{_bw}根{_brng:.3f}%")
+
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # L. VIX 轉折 × 股價位置 共振訊號（圖：VIX高位轉跌＋股價低位→強力買入）
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        _vix = fetch_vix_intraday()
+        if not _vix.get("error") and _vix.get("spot"):
+            _vix_spot   = float(_vix["spot"])
+            _vix_pct    = float(_vix.get("chg_pct_from_prev", 0))
+            _vix_trend  = _vix.get("trend_5bar", "flat")
+            _vix_signal = int(_vix.get("signal", 0))   # -4~+4
+
+            _lp = float(close.iloc[-1])
+            _lp_low20  = float(close.iloc[-20:].min()) if len(close) >= 20 else _lp
+            _lp_high20 = float(close.iloc[-20:].max()) if len(close) >= 20 else _lp
+            _lp_range  = _lp_high20 - _lp_low20
+            # 股價在近20根的相對位置（0=最低，100=最高）
+            _lp_pos = (_lp - _lp_low20) / _lp_range * 100 if _lp_range > 0 else 50
+
+            _ts = df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:13]
+
+            # ── L1. VIX 高位急跌 + 股價在低位（最強買入共振）─────────────────
+            # 圖中 20:00 場景：VIX 從高位開始下降，TSLA 從低點反彈
+            if (_vix_signal >= 2          # VIX 下跌（利多股市）
+                    and _vix_pct < -1.5   # VIX 較前日跌超1.5%
+                    and _lp_pos < 35      # 股價在近期低位
+                    and _vix_spot > 18):  # VIX 仍在相對高位（下跌空間大）
+                ck = f"{symbol}|{period_label}|VIX高位急跌低位共振|{_ts}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"🚀 【VIX×股價共振買入】VIX={_vix_spot:.1f} 高位急跌 {_vix_pct:+.1f}%"
+                              f"（{_vix.get('trend_label','')}）"
+                              f"，股價在近期低位（位置{_lp_pos:.0f}%）"
+                              f"，恐慌消退＋股價超跌，強力買入共振！", "bull")
+                    new_signals.append(f"VIX高跌{_vix_pct:.1f}%×股價低位{_lp_pos:.0f}%")
+
+            # ── L2. VIX 低位 + 股價創新高（趨勢延伸確認）────────────────────
+            elif (_vix_signal >= 1 and _vix_spot < 16 and _lp_pos > 80):
+                ck = f"{symbol}|{period_label}|VIX低位股價強勢|{_ts}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"📈 【低恐慌+強勢確認】VIX={_vix_spot:.1f} 低位平穩"
+                              f"，股價在近期高位（{_lp_pos:.0f}%）"
+                              f"，市場情緒穩定，趨勢延伸有效！", "bull")
+                    new_signals.append(f"VIX低{_vix_spot:.0f}×股價強{_lp_pos:.0f}%")
+
+            # ── L3. VIX 急升 + 股價在高位（頂部反轉預警）───────────────────
+            elif (_vix_signal <= -2       # VIX 上升（利空股市）
+                    and _vix_pct > 2.0    # VIX 較前日升超2%
+                    and _lp_pos > 70      # 股價在近期高位
+                    and _vix_spot > 18):  # VIX 有明顯水平
+                ck = f"{symbol}|{period_label}|VIX急升高位共振|{_ts}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"⚠️ 【VIX×股價共振賣出】VIX={_vix_spot:.1f} 急升 {_vix_pct:+.1f}%"
+                              f"（{_vix.get('trend_label','')}）"
+                              f"，股價在近期高位（位置{_lp_pos:.0f}%）"
+                              f"，恐慌升溫＋股價高位，注意下行風險！", "bear")
+                    new_signals.append(f"VIX急升{_vix_pct:.1f}%×股價高位{_lp_pos:.0f}%")
+
+            # ── L4. VIX 暴升（恐慌級別）+ 任意倉位（極端風險警報）────────────
+            if _vix_signal <= -4 or (_vix_pct > 10 and _vix_spot > 25):
+                ck = f"{symbol}|{period_label}|VIX極端恐慌|{_ts}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"🚨 【極端恐慌警報】VIX={_vix_spot:.1f} 暴升 {_vix_pct:+.1f}%"
+                              f"，市場進入恐慌模式，所有多單注意風控！", "bear")
+                    new_signals.append(f"VIX極端恐慌{_vix_spot:.0f}")
+
+    except Exception:
+        pass
+
+    # ── 有新信號 → 自動觸發 AI 分析 ──────────────────────────────────────────
     if not new_signals or not trigger_ai:
         return
     if not get_groq_key():
@@ -2876,13 +3889,55 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
         ann.font.size  = ann_size
         ann.font.color = "#ccddee"
 
-    # K 線
-    fig.add_trace(go.Candlestick(
-        x=xlabels, open=df["Open"], high=df["High"], low=df["Low"], close=close,
-        increasing_line_color="#00cc44", increasing_fillcolor="#00cc44",
-        decreasing_line_color="#ff4444", decreasing_fillcolor="#ff4444",
-        name="K線", showlegend=False,
-    ), row=1, col=1)
+    # K 線：區分正規時段（綠/紅）和延長時段（藍/紫）
+    try:
+        import pytz as _pytz
+        _et = _pytz.timezone("America/New_York")
+        _idx_et = df.index.tz_convert(_et) if df.index.tzinfo else df.index.tz_localize("UTC").tz_convert(_et)
+        def _is_regular(t):
+            return (t.hour > 9 or (t.hour == 9 and t.minute >= 30)) and t.hour < 16
+        _reg_mask = [_is_regular(t) for t in _idx_et]
+        _ext_mask = [not m for m in _reg_mask]
+    except Exception:
+        _reg_mask = [True] * len(df)
+        _ext_mask = [False] * len(df)
+
+    _has_ext = any(_ext_mask)
+
+    if _has_ext:
+        # 正規時段 K 線
+        _reg_idx = [i for i,m in enumerate(_reg_mask) if m]
+        if _reg_idx:
+            fig.add_trace(go.Candlestick(
+                x=[xlabels[i] for i in _reg_idx],
+                open=[df["Open"].iloc[i]  for i in _reg_idx],
+                high=[df["High"].iloc[i]  for i in _reg_idx],
+                low= [df["Low"].iloc[i]   for i in _reg_idx],
+                close=[df["Close"].iloc[i] for i in _reg_idx],
+                increasing_line_color="#00cc44", increasing_fillcolor="#00cc44",
+                decreasing_line_color="#ff4444", decreasing_fillcolor="#ff4444",
+                name="正規時段", showlegend=True,
+            ), row=1, col=1)
+        # 延長時段 K 線（藍/紫色）
+        _ext_idx = [i for i,m in enumerate(_ext_mask) if m]
+        if _ext_idx:
+            fig.add_trace(go.Candlestick(
+                x=[xlabels[i] for i in _ext_idx],
+                open=[df["Open"].iloc[i]  for i in _ext_idx],
+                high=[df["High"].iloc[i]  for i in _ext_idx],
+                low= [df["Low"].iloc[i]   for i in _ext_idx],
+                close=[df["Close"].iloc[i] for i in _ext_idx],
+                increasing_line_color="#3399ff", increasing_fillcolor="#3399ff",
+                decreasing_line_color="#9944ff", decreasing_fillcolor="#9944ff",
+                name="延長時段", showlegend=True, opacity=0.85,
+            ), row=1, col=1)
+    else:
+        fig.add_trace(go.Candlestick(
+            x=xlabels, open=df["Open"], high=df["High"], low=df["Low"], close=close,
+            increasing_line_color="#00cc44", increasing_fillcolor="#00cc44",
+            decreasing_line_color="#ff4444", decreasing_fillcolor="#ff4444",
+            name="K線", showlegend=False,
+        ), row=1, col=1)
 
     # ── 盤前/盤後 K 線疊加（Yahoo Finance 延長時段）───────────────────────
     if ext_data:
@@ -2939,6 +3994,70 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
                       annotation_text=f"支撐 {s:.2f}",
                       annotation_font=dict(size=12, color="#88ff88"),
                       annotation_bgcolor="rgba(10,30,10,0.8)", row=1, col=1)
+
+    # ── 跳空缺口視覺標記 ─────────────────────────────────────────────────────
+    try:
+        itvl_key_chart = {v[0]: k for k, v in INTERVAL_MAP.items()}.get(interval_label, "1d")
+        is_daily_chart  = itvl_key_chart in ("1d", "1wk", "1mo")
+        min_gap_vis     = 0.05 if is_daily_chart else 0.10
+        vol_ma10_chart  = df["Volume"].rolling(10).mean()
+
+        gap_up_xs, gap_up_ys, gap_up_txt   = [], [], []
+        gap_dn_xs, gap_dn_ys, gap_dn_txt   = [], [], []
+
+        scan_n = min(len(df)-1, 30)
+        for gi in range(1, scan_n + 1):
+            idx_pos  = len(df) - scan_n - 1 + gi
+            if idx_pos < 1: continue
+            b_open   = float(df["Open"].iloc[idx_pos])
+            p_high   = float(df["High"].iloc[idx_pos - 1])
+            p_low    = float(df["Low"].iloc[idx_pos - 1])
+            p_close  = float(df["Close"].iloc[idx_pos - 1])
+            if p_close == 0: continue
+            gap_up   = (b_open - p_high) / p_close * 100
+            gap_dn   = (p_low  - b_open) / p_close * 100
+            vol_ma_v = float(vol_ma10_chart.iloc[idx_pos])
+            vol_r    = float(df["Volume"].iloc[idx_pos]) / max(vol_ma_v, 1) if not (vol_ma_v != vol_ma_v) else 1.0
+
+            xlab = xlabels[idx_pos]
+            mid_gap_up = (b_open + p_high) / 2
+            mid_gap_dn = (b_open + p_low)  / 2
+
+            if gap_up >= min_gap_vis:
+                gap_up_xs.append(xlab)
+                gap_up_ys.append(mid_gap_up)
+                gap_up_txt.append(f"跳空上漲 +{gap_up:.2f}%<br>量×{vol_r:.1f} {'🔔' if vol_r>=1.3 else '⚠️'}")
+                # shaded gap zone
+                fig.add_hrect(y0=p_high, y1=b_open,
+                              fillcolor="rgba(0,255,100,0.07)",
+                              line_width=0, row=1, col=1)
+                fig.add_hline(y=p_high, line=dict(color="rgba(0,255,100,0.3)", width=1, dash="dot"),
+                              row=1, col=1)
+
+            if gap_dn >= min_gap_vis:
+                gap_dn_xs.append(xlab)
+                gap_dn_ys.append(mid_gap_dn)
+                gap_dn_txt.append(f"跳空下跌 -{gap_dn:.2f}%<br>量×{vol_r:.1f} {'🔴' if vol_r>=1.3 else '⚠️'}")
+                fig.add_hrect(y0=b_open, y1=p_low,
+                              fillcolor="rgba(255,60,60,0.07)",
+                              line_width=0, row=1, col=1)
+
+        if gap_up_xs:
+            fig.add_trace(go.Scatter(
+                x=gap_up_xs, y=gap_up_ys, mode="markers",
+                marker=dict(symbol="triangle-up", size=14,
+                            color="#00ff88", line=dict(color="#ffffff", width=1)),
+                name="跳空上漲", hovertext=gap_up_txt, hoverinfo="text+x",
+            ), row=1, col=1)
+        if gap_dn_xs:
+            fig.add_trace(go.Scatter(
+                x=gap_dn_xs, y=gap_dn_ys, mode="markers",
+                marker=dict(symbol="triangle-down", size=14,
+                            color="#ff4444", line=dict(color="#ffffff", width=1)),
+                name="跳空下跌", hovertext=gap_dn_txt, hoverinfo="text+x",
+            ), row=1, col=1)
+    except Exception:
+        pass
 
     # ── 線性回歸通道 ─────────────────────────────────────────────────────────
     try:
@@ -3165,13 +4284,282 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
 # ══════════════════════════════════════════════════════════════════════════════
 # 多週期摘要列
 # ══════════════════════════════════════════════════════════════════════════════
-def render_mtf_summary(symbol, selected_intervals, show_alerts):
+def _render_mtf_confluence(symbol: str, mtf_data: dict):
+    """
+    多週期共振分析：短週期 + 長週期信號一致時，信號可靠性大幅提升。
+    評分系統：每個條件 +1（多頭）或 -1（空頭），綜合判斷方向與強度。
+    VIX 作為全市場環境調節器：高恐慌壓制多頭訊號，低恐慌放大多頭訊號。
+    """
+    if len(mtf_data) < 2:
+        return
+
+    # ── 0. 抓取 VIX 盤中即時數據（分鐘級，比日K更即時）────────────────────
+    try:
+        vix_intra    = fetch_vix_intraday()
+        vix_spot     = vix_intra.get("spot") or None
+        vix_signal   = vix_intra.get("signal", 0)
+        vix_sig_lbl  = vix_intra.get("signal_label", "")
+        vix_sig_col  = vix_intra.get("signal_color", "#888888")
+        vix_trend_lb = vix_intra.get("trend_label", "→平穩")
+        vix_pct      = vix_intra.get("chg_pct_from_prev", 0)
+        vix_bar_time = vix_intra.get("last_bar_time", "")
+        _vix_err     = vix_intra.get("error")
+        # 期限結構用 vix_spot 或 fallback 到 term structure 的 spot
+        vix_term     = fetch_vix_term_structure()
+        if vix_spot is None:
+            vix_spot = vix_term.get("spot") or 20
+        panic_type   = vix_term.get("panic_type", "normal")
+        vix_struct   = vix_term.get("structure", "unknown")
+        vix_ok       = True
+    except Exception:
+        vix_spot, vix_signal, vix_sig_lbl = 20, 0, ""
+        vix_sig_col, vix_trend_lb, vix_pct = "#888888", "", 0
+        panic_type, vix_struct = "normal", "unknown"
+        vix_ok = False
+
+    # ── VIX 環境調節（直接使用分鐘級信號）──────────────────────────────────
+    vix_momentum_score = vix_signal   # 已包含方向，VIX漲=負分，VIX跌=正分
+    vix_momentum_label = vix_sig_lbl
+    vix_momentum_color = vix_sig_col
+    #   暴升 >+15%  → 極度恐慌，強烈看空
+    # VIX 水位調節（保持不變）
+    if panic_type == "systemic" and vix_spot > 30:
+        vix_bull_multiplier = 0.40
+        vix_bear_multiplier = 1.50
+        vix_label = f"🔴 VIX系統風險 {vix_spot:.1f} Backwardation → 多頭訊號折扣60%"
+        vix_color = "#ff4444"
+    elif panic_type == "systemic":
+        vix_bull_multiplier = 0.60
+        vix_bear_multiplier = 1.30
+        vix_label = f"🟠 VIX系統風險 {vix_spot:.1f} Backwardation → 多頭訊號折扣40%"
+        vix_color = "#ff8844"
+    elif vix_spot > 25:
+        vix_bull_multiplier = 0.80
+        vix_bear_multiplier = 1.15
+        vix_label = f"🟡 VIX偏高 {vix_spot:.1f} → 多頭訊號折扣20%"
+        vix_color = "#ffcc44"
+    elif panic_type == "short_term":
+        vix_bull_multiplier = 1.15
+        vix_bear_multiplier = 0.85
+        vix_label = f"💛 VIX短期恐慌底 {vix_spot:.1f} Contango → 逢低機會，多頭+15%"
+        vix_color = "#ffee44"
+    elif vix_spot < 15 and vix_struct == "Contango":
+        vix_bull_multiplier = 1.20
+        vix_bear_multiplier = 0.90
+        vix_label = f"🟢 VIX極低 {vix_spot:.1f} Contango → 低恐慌環境，多頭+20%"
+        vix_color = "#00cc88"
+    elif vix_spot < 20:
+        vix_bull_multiplier = 1.10
+        vix_bear_multiplier = 0.95
+        vix_label = f"🟢 VIX正常 {vix_spot:.1f} → 市場平靜，訊號正常"
+        vix_color = "#44aa77"
+    else:
+        vix_bull_multiplier = 1.0
+        vix_bear_multiplier = 1.0
+        vix_label = f"⚪ VIX {vix_spot:.1f} → 中性環境"
+        vix_color = "#667788"
+
+    # ── 1. 計算每個週期的多/空傾向分數 ──────────────────────────────────────
+    weight_map = {"1m": 1, "5m": 2, "15m": 3, "30m": 4,
+                  "1d": 6, "1wk": 8, "1mo": 10}
+
+    bull_score = 0
+    bear_score = 0
+    total_weight = 0
+    period_signals = []
+
+    for itvl, d in mtf_data.items():
+        w = weight_map.get(itvl, 2)
+        total_weight += w
+
+        s = 0
+        reasons = []
+        if d["trend"] == "多頭":    s += 2; reasons.append("多頭排列")
+        elif d["trend"] == "空頭":  s -= 2; reasons.append("空頭排列")
+        if d["dif"] > d["dea"]:     s += 1; reasons.append("MACD多方")
+        else:                        s -= 1; reasons.append("MACD空方")
+        if d["dif"] > d["dea"] and d["dif_prev"] <= d["dea_prev"]:
+            s += 2; reasons.append("剛金叉✨")
+        elif d["dif"] < d["dea"] and d["dif_prev"] >= d["dea_prev"]:
+            s -= 2; reasons.append("剛死叉💀")
+        if d["ema5"] > d["ema20"]:  s += 1; reasons.append("短均多頭")
+        else:                        s -= 1; reasons.append("短均空頭")
+
+        # 套用 VIX 調節到各週期分數
+        s_adj = s * vix_bull_multiplier if s > 0 else s * vix_bear_multiplier
+        bull_score += max(0,  s_adj) * w
+        bear_score += max(0, -s_adj) * w
+        period_signals.append({
+            "itvl": itvl, "label": d["label"],
+            "score": s, "score_adj": s_adj, "w": w, "reasons": reasons
+        })
+
+    # ── 2. 共振強度計算（含 VIX 調節）──────────────────────────────────────
+    max_possible = total_weight * 5 * max(vix_bull_multiplier, vix_bear_multiplier)
+    bull_pct = bull_score / max_possible * 100 if max_possible else 0
+    bear_pct = bear_score / max_possible * 100 if max_possible else 0
+    net_pct  = bull_pct - bear_pct
+
+    # VIX 動量作為獨立加減項（±4~±8 分，相當於一個強週期訊號）
+    # 直接加到 net_pct（每 1 分 ≈ 5% 影響）
+    vix_momentum_contribution = vix_momentum_score * 5
+    net_pct_raw    = net_pct   # 保留未調整值供顯示
+    net_pct       += vix_momentum_contribution
+
+    bull_periods   = sum(1 for p in period_signals if p["score"] > 0)
+    bear_periods   = sum(1 for p in period_signals if p["score"] < 0)
+    total_periods  = len(period_signals)
+    consensus_ratio = max(bull_periods, bear_periods) / total_periods if total_periods else 0
+
+    if net_pct > 25 and consensus_ratio >= 0.75:
+        confluence_label = "🚀 強烈多頭共振"
+        bar_color = "#00ff88"
+        bg_color  = "rgba(0,60,30,0.5)"
+        direction = "LONG"
+    elif net_pct > 10 and consensus_ratio >= 0.6:
+        confluence_label = "📈 多頭偏向"
+        bar_color = "#44cc88"
+        bg_color  = "rgba(0,40,20,0.4)"
+        direction = "偏多"
+    elif net_pct < -25 and consensus_ratio >= 0.75:
+        confluence_label = "💀 強烈空頭共振"
+        bar_color = "#ff4444"
+        bg_color  = "rgba(60,0,0,0.5)"
+        direction = "SHORT"
+    elif net_pct < -10 and consensus_ratio >= 0.6:
+        confluence_label = "📉 空頭偏向"
+        bar_color = "#cc4444"
+        bg_color  = "rgba(40,0,0,0.4)"
+        direction = "偏空"
+    else:
+        confluence_label = "⚖️ 多空分歧，觀望"
+        bar_color = "#888888"
+        bg_color  = "rgba(30,30,30,0.4)"
+        direction = "中性"
+
+    # ── 3. 短週期 vs 長週期背離偵測 ──────────────────────────────────────
+    divergence_msg = ""
+    itvl_keys = list(mtf_data.keys())
+    if len(itvl_keys) >= 2:
+        short_itvl = itvl_keys[0]   # 最短週期（如 1m）
+        long_itvl  = itvl_keys[-1]  # 最長週期（如 30m）
+        short_score = next(p["score"] for p in period_signals if p["itvl"] == short_itvl)
+        long_score  = next(p["score"] for p in period_signals if p["itvl"] == long_itvl)
+        short_label = mtf_data[short_itvl]["label"]
+        long_label  = mtf_data[long_itvl]["label"]
+        if short_score > 1 and long_score < -1:
+            divergence_msg = f"⚠️ 背離警告：{short_label} 偏多 但 {long_label} 偏空 → 短多不可靠，等長週期轉向"
+        elif short_score < -1 and long_score > 1:
+            divergence_msg = f"💡 反彈機會：{short_label} 偏空 但 {long_label} 偏多 → 短空可能是回調，長線仍多"
+
+    # ── 4. 渲染共振面板 ────────────────────────────────────────────────────
+    bar_w  = min(100, abs(net_pct) * 2)
+
+    # VIX 壓力條（獨立顯示，視覺化調節幅度）
+    vix_bar_w = min(100, vix_spot * 2.5)   # VIX 40 → 100%
+    vix_adj_pct = abs(vix_bull_multiplier - 1.0) * 100
+    vix_adj_sign = "+" if vix_bull_multiplier > 1 else "-"
+    vix_adj_str = f"{vix_adj_sign}{vix_adj_pct:.0f}% 多頭" if vix_bull_multiplier != 1.0 else "中性"
+
+    rows_html = ""
+    for p in period_signals:
+        _s    = p["score"]
+        _sadj = p.get("score_adj", _s)
+        _col  = "#00cc66" if _s > 0 else ("#ff4444" if _s < 0 else "#888888")
+        _icon = "▲" if _s > 2 else ("△" if _s > 0 else ("▼" if _s < -2 else ("▽" if _s < 0 else "◆")))
+        _reasons = " · ".join(p["reasons"][:3])
+        # 若VIX調節改變了分數方向，顯示警告
+        _adj_note = ""
+        if vix_bull_multiplier != 1.0 and _s > 0:
+            _adj_note = f' <span style="color:{vix_color};font-size:0.65rem;">×{vix_bull_multiplier:.2f}</span>'
+        rows_html += (
+            f'<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid #1a2535;">'
+            f'  <span style="color:#6688aa;min-width:38px;font-size:0.78rem;">{p["label"]}</span>'
+            f'  <span style="color:{_col};font-weight:700;min-width:20px;">{_icon}</span>'
+            f'  <div style="flex:1;background:#0d1520;border-radius:3px;height:5px;">'
+            f'    <div style="width:{min(100,abs(_s)*20)}%;height:100%;background:{_col};border-radius:3px;"></div>'
+            f'  </div>'
+            f'  <span style="color:#445566;font-size:0.7rem;min-width:140px;">{_reasons}</span>'
+            f'  {_adj_note}'
+            f'</div>'
+        )
+
+    div_html = (
+        f'<div style="background:#0d1a2d;border:1px solid #1e3050;border-radius:8px;padding:12px 16px;margin:10px 0;">'
+        # 標題列
+        f'  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">'
+        f'    <span style="font-weight:700;font-size:1rem;color:#cce8ff;">🔗 多週期共振分析</span>'
+        f'    <span style="background:{bar_color}22;border:1px solid {bar_color}55;'
+        f'          color:{bar_color};padding:3px 10px;border-radius:12px;font-weight:700;">'
+        f'      {confluence_label}</span>'
+        f'  </div>'
+        # VIX 盤中即時動量列
+        f'  <div style="background:#0a1525;border:1px solid {vix_momentum_color}44;border-radius:6px;'
+        f'       padding:6px 10px;margin-bottom:6px;display:flex;align-items:center;gap:10px;">'
+        f'    <span style="color:{vix_momentum_color};font-size:0.75rem;font-weight:700;min-width:60px;">'
+        f'      📡 VIX即時</span>'
+        f'    <span style="color:{vix_momentum_color};font-size:0.82rem;font-weight:700;">'
+        f'      {vix_spot:.2f}　{vix_trend_lb}　{vix_pct:+.1f}%</span>'
+        f'    <span style="color:{vix_momentum_color};font-size:0.78rem;flex:1;">'
+        f'      　{vix_momentum_label}</span>'
+        f'    <span style="color:#334455;font-size:0.68rem;">更新:{vix_bar_time}</span>'
+        f'  </div>'
+        # VIX 期限結構環境列
+        f'  <div style="background:#0a1525;border:1px solid {vix_color}44;border-radius:6px;'
+        f'       padding:6px 10px;margin-bottom:10px;display:flex;align-items:center;gap:10px;">'
+        f'    <span style="color:{vix_color};font-size:0.75rem;font-weight:700;min-width:60px;">'
+        f'      📊 VIX環境</span>'
+        f'    <div style="flex:1;background:#0d1520;border-radius:3px;height:6px;">'
+        f'      <div style="width:{vix_bar_w:.0f}%;height:100%;background:linear-gradient(90deg,#44aa77,#ffcc44,#ff4444);'
+        f'           border-radius:3px;"></div>'
+        f'      <div style="width:2px;height:10px;background:#fff3;position:relative;'
+        f'           margin-top:-8px;left:{min(98,vix_bar_w):.0f}%;"></div>'
+        f'    </div>'
+        f'    <span style="color:{vix_color};font-size:0.78rem;min-width:260px;">'
+        f'      {vix_label}　<span style="color:#667788;">({vix_adj_str})</span></span>'
+        f'  </div>'
+        # 多空強度條
+        f'  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">'
+        f'    <span style="color:#445566;font-size:0.75rem;">空頭</span>'
+        f'    <div style="flex:1;background:#0d1520;border-radius:4px;height:8px;position:relative;">'
+        f'      <div style="width:{bar_w/2}%;height:100%;background:{bar_color};border-radius:4px;'
+        f'           position:absolute;{"left:50%" if net_pct>=0 else f"left:{50-bar_w/2}%"};"></div>'
+        f'      <div style="width:1px;height:100%;background:#445566;position:absolute;left:50%;"></div>'
+        f'    </div>'
+        f'    <span style="color:#445566;font-size:0.75rem;">多頭</span>'
+        f'    <span style="color:{bar_color};font-weight:700;min-width:60px;text-align:right;">'
+        f'      {direction} {abs(net_pct):.0f}%</span>'
+        f'  </div>'
+        f'  {rows_html}'
+        f'  <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">'
+        f'    <span style="color:#445566;font-size:0.75rem;">空頭</span>'
+        f'    <div style="flex:1;background:#0d1520;border-radius:4px;height:8px;position:relative;">'
+        f'      <div style="width:50%;height:100%;background:#1e2e40;position:absolute;left:0;"></div>'
+        f'      <div style="width:{bar_w/2}%;height:100%;background:{bar_color};border-radius:4px;'
+        f'           position:absolute;{"left:50%" if net_pct>=0 else f"left:{50-bar_w/2}%"};"></div>'
+        f'      <div style="width:1px;height:100%;background:#445566;position:absolute;left:50%;"></div>'
+        f'    </div>'
+        f'    <span style="color:#445566;font-size:0.75rem;">多頭</span>'
+        f'    <span style="color:{bar_color};font-weight:700;min-width:60px;text-align:right;">'
+        f'      {direction} {abs(net_pct):.0f}%</span>'
+        f'  </div>'
+        f'  {rows_html}'
+        + (f'  <div style="margin-top:8px;padding:6px 10px;background:#1a2030;border-radius:5px;'
+           f'       color:#ffaa44;font-size:0.8rem;">{divergence_msg}</div>' if divergence_msg else '')
+        + f'</div>'
+    )
+    st.markdown(f'<div id="mtf-confluence-{symbol}">{div_html}</div>',
+                unsafe_allow_html=True)
+
+
+def render_mtf_summary(symbol, selected_intervals, show_alerts, prepost=False):
     st.markdown(f'<div class="mtf-section-title">🔀 多週期總覽 — {symbol}</div>',
                 unsafe_allow_html=True)
-    rows = []
+    rows    = []
+    mtf_data = {}   # {itvl: {"df": df, "label": label, "trend": trend, ...}}
     for itvl in selected_intervals:
         label, _ = INTERVAL_MAP[itvl]
-        df = fetch_data(symbol, itvl)
+        df = fetch_data(symbol, itvl, prepost=prepost)
         if df.empty:
             rows.append(
                 f'<div class="mtf-header"><span class="mtf-period">{label}</span>'
@@ -3203,6 +4591,38 @@ def render_mtf_summary(symbol, selected_intervals, show_alerts):
         ema_s     = get_ema_signal(df)
         ema_cls   = "mtf-ema-bull" if any(x in ema_s for x in ["↑","多"]) else "mtf-ema-bear"
 
+        # EMA 聚合壓縮度
+        _ema_ns = [5, 10, 20, 30, 60]
+        _ema_vs = [float(calc_ema(df["Close"], n).iloc[-1]) for n in _ema_ns]
+        _mean_v = sum(_ema_vs) / len(_ema_vs)
+        _compress = (max(_ema_vs) - min(_ema_vs)) / _mean_v * 100 if _mean_v else 999
+        if _compress < 0.15:
+            compress_tag = f'<span style="color:#ff9900;font-weight:700;animation:blink 1s infinite;">⚡聚合{_compress:.2f}%</span>'
+        elif _compress < 0.40:
+            compress_tag = f'<span style="color:#ffcc00;">🔶聚合{_compress:.2f}%</span>'
+        elif _compress < 0.80:
+            compress_tag = f'<span style="color:#88aacc;">收縮{_compress:.2f}%</span>'
+        else:
+            compress_tag = f'<span style="color:#445566;">分散{_compress:.2f}%</span>'
+
+        # 收集多週期數據供共振分析
+        _dif, _dea, _ = calc_macd(df["Close"])
+        mtf_data[itvl] = {
+            "label":    label,
+            "df":       df,
+            "trend":    trend,
+            "macd_s":   macd_s,
+            "dif":      float(_dif.iloc[-1]),
+            "dea":      float(_dea.iloc[-1]),
+            "dif_prev": float(_dif.iloc[-2]) if len(_dif) > 1 else float(_dif.iloc[-1]),
+            "dea_prev": float(_dea.iloc[-2]) if len(_dea) > 1 else float(_dea.iloc[-1]),
+            "close":    float(df["Close"].iloc[-1]),
+            "compress": _compress,
+            "ema5":     _ema_vs[0],
+            "ema20":    float(calc_ema(df["Close"], 20).iloc[-1]),
+            "ema60":    float(calc_ema(df["Close"], 60).iloc[-1]),
+        }
+
         rows.append(
             f'<div class="mtf-header">'
             f'  <span class="mtf-period">{label}</span>'
@@ -3216,14 +4636,21 @@ def render_mtf_summary(symbol, selected_intervals, show_alerts):
             f'  <div class="mtf-divider"></div>'
             f'  <span class="{macd_cls}">MACD: {macd_s}</span>'
             f'  <span class="{ema_cls}">EMA: {ema_s}</span>'
+            f'  <div class="mtf-divider"></div>'
+            f'  {compress_tag}'
             f'</div>'
         )
-    st.markdown("".join(rows), unsafe_allow_html=True)
+    st.markdown(f'<div id="mtf-rows-{symbol}">{"".join(rows)}</div>',
+                unsafe_allow_html=True)
+
+    # ── 多週期共振分析（跨週期連動預測）────────────────────────────────────
+    if len(mtf_data) >= 2:
+        _render_mtf_confluence(symbol, mtf_data)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 多週期 K 線圖
 # ══════════════════════════════════════════════════════════════════════════════
-def render_mtf_charts(symbol, selected_intervals, layout_mode, max_bars=90):
+def render_mtf_charts(symbol, selected_intervals, layout_mode, max_bars=90, prepost=False):
     if not selected_intervals:
         st.info("請至少選擇一個時間週期")
         return
@@ -3236,7 +4663,7 @@ def render_mtf_charts(symbol, selected_intervals, layout_mode, max_bars=90):
             cols = st.columns(len(pair))
             for col, itvl in zip(cols, pair):
                 label, _ = INTERVAL_MAP[itvl]
-                df = fetch_data(symbol, itvl)
+                df = fetch_data(symbol, itvl, prepost=prepost)
                 with col:
                     if df.empty:
                         st.error(f"{label} 無數據")
@@ -3249,7 +4676,7 @@ def render_mtf_charts(symbol, selected_intervals, layout_mode, max_bars=90):
     else:
         for itvl in selected_intervals:
             label, _ = INTERVAL_MAP[itvl]
-            df = fetch_data(symbol, itvl)
+            df = fetch_data(symbol, itvl, prepost=prepost)
             if df.empty:
                 st.error(f"{label} 無數據")
             else:
@@ -3264,8 +4691,9 @@ def render_mtf_charts(symbol, selected_intervals, layout_mode, max_bars=90):
 # ══════════════════════════════════════════════════════════════════════════════
 def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, show_post=False, show_night=False):
     label, _ = INTERVAL_MAP[interval]
+    _prepost = show_pre or show_post or show_night
     with st.spinner(f"載入 {symbol} {label} 數據中..."):
-        df = fetch_data(symbol, interval)
+        df = fetch_data(symbol, interval, prepost=_prepost)
 
     if df.empty:
         st.error(f"❌ 無法取得 {symbol} 數據")
@@ -3279,6 +4707,34 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
     vol_now = int(df["Volume"].iloc[-1])
     trend   = detect_trend(df)
 
+    # 判斷最新數據時間和時段
+    try:
+        import pytz as _ptz
+        _et = _ptz.timezone("America/New_York")
+        _last_ts = df.index[-1]
+        if _last_ts.tzinfo is None:
+            _last_ts = _last_ts.tz_localize("UTC").tz_convert(_et)
+        else:
+            _last_ts = _last_ts.tz_convert(_et)
+        _h, _m = _last_ts.hour, _last_ts.minute
+        if (_h > 9 or (_h == 9 and _m >= 30)) and _h < 16:
+            _session_label = "🟢 正規盤中"
+            _session_color = "#00cc44"
+        elif _h >= 4 and (_h < 9 or (_h == 9 and _m < 30)):
+            _session_label = "🔵 盤前"
+            _session_color = "#3399ff"
+        elif _h >= 16 and _h < 20:
+            _session_label = "🟡 盤後"
+            _session_color = "#ffcc00"
+        else:
+            _session_label = "🌙 夜盤"
+            _session_color = "#aa88ff"
+        _data_time_str = _last_ts.strftime("%m/%d %H:%M ET")
+    except Exception:
+        _session_label = ""
+        _session_color = "#888888"
+        _data_time_str = ""
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("最新價格",      f"${last:.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
     c2.metric("成交量（萬股）", f"{vol_now/10000:.1f}")
@@ -3289,8 +4745,28 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
     with c5:
         st.markdown(
             f'<div class="trend-card"><div class="trend-title">趨勢判斷</div>'
-            f'<div class="{t_cls}">{t_icon} {trend}</div></div>',
+            f'<div class="{t_cls}">{t_icon} {trend}</div>'
+            f'<div style="font-size:0.68rem;color:{_session_color};margin-top:3px;">'
+            f'{_session_label}</div>'
+            f'<div style="font-size:0.62rem;color:#445566;">{_data_time_str}</div>'
+            f'</div>',
             unsafe_allow_html=True)
+
+    # 如果數據時間超過 15 分鐘，提示用戶刷新
+    try:
+        from datetime import datetime as _dtnow, timezone as _tz
+        _now_et = datetime.now(_ptz.timezone("America/New_York"))
+        _age_min = (_now_et - _last_ts).total_seconds() / 60
+        if _age_min > 15 and _prepost:
+            col_warn, col_btn = st.columns([3, 1])
+            with col_warn:
+                st.warning(f"⚠️ 數據時間：{_data_time_str}（{_age_min:.0f} 分鐘前），可能非最新盤前數據")
+            with col_btn:
+                if st.button("🔄 強制刷新", key=f"force_refresh_{symbol}_{interval}"):
+                    st.cache_data.clear()
+                    st.rerun()
+    except Exception:
+        pass
 
     # EMA 列
     items = []
@@ -3347,8 +4823,16 @@ with st.sidebar:
     st.title("📈 美股監控系統")
     st.markdown("---")
 
-    raw_input = st.text_area("股票代號（逗號分隔）", value="TSLA", height=80)
-    symbols   = [s.strip().upper() for s in raw_input.replace("，",",").split(",") if s.strip()]
+    raw_input = st.text_area("股票代號（空格分隔，例：TSLA AAPL NVDA）", value="", height=80,
+                             key="symbol_input_area",
+                             placeholder="TSLA AAPL NVDA")
+    # 同時支援空格、逗號、換行、全形逗號分隔
+    import re as _re
+    symbols = [s.strip().upper() for s in _re.split(r'[\s,，\n]+', raw_input) if s.strip()]
+    # 過濾非法代號（只允許字母和.）
+    symbols = [s for s in symbols if _re.match(r'^[A-Z\.\-]{1,10}$', s)]
+    # 同步到 session_state 讓 send_telegram 能檢查
+    st.session_state["_active_symbols"] = symbols
 
     st.markdown("---")
     st.markdown("#### 📅 監控模式")
@@ -3440,6 +4924,11 @@ with st.sidebar:
         st.session_state.sent_alerts = set()
         st.toast("警示記錄已清除")
 
+    if st.button("🔄 強制刷新數據快取"):
+        st.cache_data.clear()
+        st.toast("快取已清除，下次刷新將重新抓取最新數據")
+        st.rerun()
+
     if st.session_state.alert_log:
         csv_data = pd.DataFrame(st.session_state.alert_log).to_csv(
             index=False, encoding="utf-8-sig")
@@ -3454,7 +4943,12 @@ with st.sidebar:
 st.title("🇺🇸 美股即時監控系統")
 
 if not symbols:
-    st.info("請在左側輸入股票代號")
+    st.session_state["_active_symbols"] = []   # 立即清空，阻止任何後續發送
+    st.info("👈 請在左側輸入股票代號（例如：TSLA AAPL NVDA）")
+    if auto_refresh:
+        time.sleep(refresh_sec)
+        st.cache_data.clear()
+        st.rerun()
     st.stop()
 
 # ── 市場環境面板（置頂）──────────────────────────────────────────────────────
@@ -3473,11 +4967,12 @@ for tab, symbol in zip(stock_tabs, symbols):
             if not selected:
                 st.warning("⚠️ 請在左側至少勾選一個時間週期")
             else:
+                _mtf_prepost = show_pre or show_post or show_night
                 # ① 多週期摘要
-                render_mtf_summary(symbol, selected, show_alerts)
+                render_mtf_summary(symbol, selected, show_alerts, prepost=_mtf_prepost)
                 st.markdown("---")
                 # ② 多週期 K 線圖
-                render_mtf_charts(symbol, selected, layout_mode, max_bars=max_bars)
+                render_mtf_charts(symbol, selected, layout_mode, max_bars=max_bars, prepost=_mtf_prepost)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3554,7 +5049,8 @@ if st.session_state.alert_log:
             f'</div></div>'
         )
     all_cards.append('</div>')
-    st.markdown("".join(all_cards), unsafe_allow_html=True)
+    st.markdown(f'<div id="alert-cards-panel">{"".join(all_cards)}</div>',
+                unsafe_allow_html=True)
 
     # ── 整體市場情緒 ─────────────────────────────────────────────────────────
     total_bull = sum(v["bull"] for v in sym_stats.values())
