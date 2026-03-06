@@ -3870,6 +3870,110 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                               f"，市場進入恐慌模式，所有多單注意風控！", "bear")
                     new_signals.append(f"VIX極端恐慌{_vix_spot:.0f}")
 
+            # ── L5. VIX 絕對水平警戒區（無論漲跌，水平本身就有意義）─────────
+            # 圖中 VIX=25.66 已進入高恐慌區（>25），TSLA 對應跌到 399 區
+            _vix_zone_ck = f"{symbol}|{period_label}|VIX水平警戒|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+            if _vix_zone_ck not in st.session_state.sent_alerts:
+                if _vix_spot >= 30:
+                    st.session_state.sent_alerts.add(_vix_zone_ck)
+                    add_alert(symbol, period_label,
+                              f"🚨 【VIX極度恐慌區】VIX={_vix_spot:.1f} ≥30"
+                              f"，歷史上此水平對應市場重大下跌，極端謹慎！", "bear")
+                    new_signals.append(f"VIX極度恐慌≥30")
+                elif _vix_spot >= 25:
+                    st.session_state.sent_alerts.add(_vix_zone_ck)
+                    add_alert(symbol, period_label,
+                              f"⚠️ 【VIX高恐慌區】VIX={_vix_spot:.1f} 介於25-30"
+                              f"，市場恐慌情緒明顯，股票下行壓力大，謹慎持多！", "bear")
+                    new_signals.append(f"VIX高恐慌25-30")
+                elif _vix_spot <= 13:
+                    st.session_state.sent_alerts.add(_vix_zone_ck)
+                    add_alert(symbol, period_label,
+                              f"📈 【VIX極低恐慌區】VIX={_vix_spot:.1f} ≤13"
+                              f"，市場極度樂觀，適合持多，但需防黑天鵝！", "bull")
+                    new_signals.append(f"VIX極低樂觀≤13")
+
+            # ── L6. VIX 盤中急升偵測（當日漲幅，圖中3/6當天+28%場景）─────────
+            # chg_pct_from_prev 是相對前日收盤的變化
+            _vix_intraday_surge = abs(_vix_pct) > 15  # 當日漲跌超15%
+            if _vix_intraday_surge:
+                _surge_ck = f"{symbol}|{period_label}|VIX盤中急升|{_ts}"
+                if _surge_ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(_surge_ck)
+                    if _vix_pct > 15:   # 急升→股市恐慌
+                        add_alert(symbol, period_label,
+                                  f"🚨 【VIX盤中暴升{_vix_pct:+.0f}%】VIX={_vix_spot:.1f}"
+                                  f"，單日恐慌指數暴增，可能對應股市急跌！"
+                                  f"（參考：股價近期低位{_lp_low20:.2f}）", "bear")
+                        new_signals.append(f"VIX盤中暴升{_vix_pct:.0f}%")
+                    else:               # 急跌→恐慌消退
+                        add_alert(symbol, period_label,
+                                  f"🚀 【VIX盤中暴跌{_vix_pct:.0f}%】VIX={_vix_spot:.1f}"
+                                  f"，恐慌指數單日大幅消退，股市反彈機率大！", "bull")
+                        new_signals.append(f"VIX盤中暴跌{_vix_pct:.0f}%")
+
+            # ── L7. VIX 多日趨勢偵測（日K視角：圖中從15→23.76持續上升）────────
+            try:
+                _vix_hist = fetch_vix_history()
+                if len(_vix_hist) >= 10:
+                    _vh = _vix_hist.values
+                    _vh_now  = float(_vh[-1])
+                    _vh_5d   = float(_vh[-5])    # 5日前
+                    _vh_10d  = float(_vh[-10])   # 10日前
+                    _vh_low  = float(min(_vh[-20:]))  # 近20日最低
+                    _vh_high = float(max(_vh[-20:]))  # 近20日最高
+
+                    # 多日累計升幅
+                    _vix_5d_chg  = (_vh_now - _vh_5d)  / _vh_5d  * 100
+                    _vix_10d_chg = (_vh_now - _vh_10d) / _vh_10d * 100
+
+                    # 位置：在近20日區間的百分位
+                    _vix_pos = (_vh_now - _vh_low) / (_vh_high - _vh_low) * 100 if _vh_high > _vh_low else 50
+
+                    _ts_day = df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:10]
+
+                    # VIX 多日持續上升（系統性風險積累）
+                    if _vix_5d_chg > 15 and _vix_10d_chg > 20:
+                        _ck7 = f"{symbol}|{period_label}|VIX多日上升趨勢|{_ts_day}"
+                        if _ck7 not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck7)
+                            if _vix_10d_chg > 40:
+                                _v7g = "🚨 系統性風險警報"
+                            elif _vix_10d_chg > 25:
+                                _v7g = "⚠️ 風險持續累積"
+                            else:
+                                _v7g = "📊 恐慌升溫"
+                            add_alert(symbol, period_label,
+                                      f"{_v7g}｜VIX 5日+{_vix_5d_chg:.0f}%、10日+{_vix_10d_chg:.0f}%"
+                                      f"（{_vh_10d:.1f}→{_vh_now:.1f}）"
+                                      f"，恐慌情緒持續累積，非短期波動！"
+                                      f"（VIX在近20日{_vix_pos:.0f}%分位）", "bear")
+                            new_signals.append(f"VIX多日升{_vix_10d_chg:.0f}%")
+
+                    # VIX 多日持續下降（系統性風險消退，利多）
+                    elif _vix_5d_chg < -15 and _vix_10d_chg < -20:
+                        _ck7 = f"{symbol}|{period_label}|VIX多日下降趨勢|{_ts_day}"
+                        if _ck7 not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck7)
+                            add_alert(symbol, period_label,
+                                      f"📈 【恐慌持續消退】VIX 5日{_vix_5d_chg:.0f}%、10日{_vix_10d_chg:.0f}%"
+                                      f"（{_vh_10d:.1f}→{_vh_now:.1f}）"
+                                      f"，市場風險持續下降，有利股市上漲！", "bull")
+                            new_signals.append(f"VIX多日降{_vix_10d_chg:.0f}%")
+
+                    # VIX 處於近期高位且未回落（壓頂）
+                    if _vix_pos > 80 and _vh_now > 20:
+                        _ck7b = f"{symbol}|{period_label}|VIX近期高位壓頂|{_ts_day}"
+                        if _ck7b not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck7b)
+                            add_alert(symbol, period_label,
+                                      f"⚠️ 【VIX近期高位壓頂】VIX={_vh_now:.1f} 處於20日{_vix_pos:.0f}%分位"
+                                      f"（近期低{_vh_low:.1f} 高{_vh_high:.1f}）"
+                                      f"，恐慌未消退，股市反彈空間受限！", "bear")
+                            new_signals.append(f"VIX高位壓頂{_vh_now:.0f}")
+            except Exception:
+                pass
+
     except Exception:
         pass
 
