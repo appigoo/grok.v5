@@ -1976,6 +1976,44 @@ def calc_rsi(series, period=14):
     rs    = gain / loss.replace(0, np.nan)
     return 100 - 100 / (1 + rs)
 
+def calc_adx(df, period=14):
+    """
+    計算 ADX / +DI / -DI（趨勢強度與方向）
+    ADX>25 趨勢有效；-DI>+DI 空頭主導；+DI>-DI 多頭主導
+    """
+    try:
+        hi = df["High"]; lo = df["Low"]; cl = df["Close"]
+        tr = pd.concat([
+            (hi - lo),
+            (hi - cl.shift(1)).abs(),
+            (lo - cl.shift(1)).abs()
+        ], axis=1).max(axis=1)
+        up = hi.diff(); dn = -lo.diff()
+        pdm = up.where((up > dn) & (up > 0), 0.0)
+        ndm = dn.where((dn > up) & (dn > 0), 0.0)
+        atr = tr.ewm(com=period-1, adjust=False).mean()
+        pdi = 100 * pdm.ewm(com=period-1, adjust=False).mean() / atr.replace(0, np.nan)
+        ndi = 100 * ndm.ewm(com=period-1, adjust=False).mean() / atr.replace(0, np.nan)
+        dx  = ((pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)) * 100
+        adx = dx.ewm(com=period-1, adjust=False).mean()
+        return adx, pdi, ndi
+    except Exception:
+        empty = pd.Series([np.nan]*len(df))
+        return empty, empty, empty
+
+def calc_willr(df, period=14):
+    """
+    Williams %R：範圍 -100~0
+    < -80 超賣（潛在反彈）；> -20 超買（潛在回落）
+    """
+    try:
+        hi_max = df["High"].rolling(period).max()
+        lo_min = df["Low"].rolling(period).min()
+        rng = hi_max - lo_min
+        return -100 * (hi_max - df["Close"]) / rng.replace(0, np.nan)
+    except Exception:
+        return pd.Series([np.nan]*len(df))
+
 
 def calc_pivot(df, interval: str = "1d"):
     """
@@ -3835,7 +3873,123 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     except Exception:
         pass
 
-    # ── 有新信號 → 自動觸發 AI 分析 ──────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # M. ADX 趨勢強度 + Williams %R 超買超賣偵測
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        if len(df) >= 20 and "High" in df.columns and "Low" in df.columns:
+            _adx, _pdi, _ndi = calc_adx(df, 14)
+            _willr = calc_willr(df, 14)
+
+            _adx_v  = float(_adx.iloc[-1])  if not np.isnan(float(_adx.iloc[-1]))  else None
+            _pdi_v  = float(_pdi.iloc[-1])  if not np.isnan(float(_pdi.iloc[-1]))  else None
+            _ndi_v  = float(_ndi.iloc[-1])  if not np.isnan(float(_ndi.iloc[-1]))  else None
+            _wr_v   = float(_willr.iloc[-1]) if not np.isnan(float(_willr.iloc[-1])) else None
+            _wr_p   = float(_willr.iloc[-2]) if len(_willr)>=2 and not np.isnan(float(_willr.iloc[-2])) else _wr_v
+            _adx_p  = float(_adx.iloc[-2])  if len(_adx)>=2  and not np.isnan(float(_adx.iloc[-2]))  else _adx_v
+
+            _ts = df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:13]
+
+            # ── M1. ADX 空頭趨勢確認（-DI>+DI 且 ADX>25）────────────────────
+            if _adx_v and _pdi_v and _ndi_v:
+                _bear_trend = _ndi_v > _pdi_v and _adx_v > 25
+                _bull_trend = _pdi_v > _ndi_v and _adx_v > 25
+                _adx_rising = _adx_v > _adx_p if _adx_p else False
+
+                if _bear_trend:
+                    ck = f"{symbol}|{period_label}|ADX空頭趨勢|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        _strength = "強烈" if _adx_v > 35 else "有效" if _adx_v > 25 else "醞釀中"
+                        add_alert(symbol, period_label,
+                                  f"💀 【ADX空頭趨勢{_strength}】ADX={_adx_v:.1f}"
+                                  f"，-DI({_ndi_v:.1f})>+DI({_pdi_v:.1f})空頭主導"
+                                  f"{'，ADX上升趨勢加強中！' if _adx_rising else '，ADX持平趨勢穩定。'}", "bear")
+                        new_signals.append(f"ADX空頭{_adx_v:.0f}-DI>{_pdi_v:.0f}")
+
+                elif _bull_trend:
+                    ck = f"{symbol}|{period_label}|ADX多頭趨勢|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        _strength = "強烈" if _adx_v > 35 else "有效"
+                        add_alert(symbol, period_label,
+                                  f"🚀 【ADX多頭趨勢{_strength}】ADX={_adx_v:.1f}"
+                                  f"，+DI({_pdi_v:.1f})>-DI({_ndi_v:.1f})多頭主導"
+                                  f"{'，ADX上升趨勢加強！' if _adx_rising else '。'}", "bull")
+                        new_signals.append(f"ADX多頭{_adx_v:.0f}+DI>{_ndi_v:.0f}")
+
+                # ── M2. DI 交叉（方向轉換最早期訊號）────────────────────────
+                _pdi_p = float(_pdi.iloc[-2]) if len(_pdi)>=2 else _pdi_v
+                _ndi_p = float(_ndi.iloc[-2]) if len(_ndi)>=2 else _ndi_v
+                _bull_cross = _pdi_v > _ndi_v and _pdi_p <= _ndi_p   # +DI上穿-DI
+                _bear_cross = _ndi_v > _pdi_v and _ndi_p <= _pdi_p   # -DI上穿+DI
+
+                if _bull_cross:
+                    ck = f"{symbol}|{period_label}|DI多頭交叉|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📈 【DI多頭交叉】+DI({_pdi_v:.1f}) 上穿 -DI({_ndi_v:.1f})"
+                                  f"，方向由空轉多，趨勢反轉訊號！ADX={_adx_v:.1f}", "bull")
+                        new_signals.append(f"DI多頭交叉")
+
+                elif _bear_cross:
+                    ck = f"{symbol}|{period_label}|DI空頭交叉|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📉 【DI空頭交叉】-DI({_ndi_v:.1f}) 上穿 +DI({_pdi_v:.1f})"
+                                  f"，方向由多轉空，趨勢反轉訊號！ADX={_adx_v:.1f}", "bear")
+                        new_signals.append(f"DI空頭交叉")
+
+            # ── M3. Williams %R 超買/超賣偵測 ────────────────────────────────
+            if _wr_v is not None:
+                # 超賣回升穿越-80（底部反彈訊號）
+                if _wr_p is not None and _wr_p < -80 and _wr_v >= -80:
+                    ck = f"{symbol}|{period_label}|WR超賣回升|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"🟢 【Williams %R超賣回升】WR穿越-80({_wr_v:.1f})"
+                                  f"，從超賣區反彈，潛在底部買入機會！", "bull")
+                        new_signals.append(f"WR超賣回升{_wr_v:.0f}")
+
+                # 超買回落穿越-20（頂部回落訊號）
+                elif _wr_p is not None and _wr_p > -20 and _wr_v <= -20:
+                    ck = f"{symbol}|{period_label}|WR超買回落|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"🔴 【Williams %R超買回落】WR穿越-20({_wr_v:.1f})"
+                                  f"，從超買區回落，潛在頂部賣出訊號！", "bear")
+                        new_signals.append(f"WR超買回落{_wr_v:.0f}")
+
+                # 持續在超賣區（-80以下）且開始回升
+                elif _wr_v < -80 and _wr_p is not None and _wr_v > _wr_p:
+                    ck = f"{symbol}|{period_label}|WR深度超賣回升|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"💡 【Williams %R深度超賣】WR={_wr_v:.1f}(<-80)"
+                                  f" 且開始回升，極度超賣反彈機率高！", "bull")
+                        new_signals.append(f"WR深度超賣{_wr_v:.0f}")
+
+                # M4. ADX+WR 組合：趨勢有效 + 未到超賣（圖中當前狀態：ADX=25，WR=-47）
+                # 含義：空頭趨勢有效，但WR還在中間，跌勢可能繼續
+                if (_adx_v and _ndi_v and _pdi_v
+                        and _adx_v > 25 and _ndi_v > _pdi_v    # 有效空頭趨勢
+                        and -80 < _wr_v < -20):                  # WR中性（未超賣）
+                    ck = f"{symbol}|{period_label}|ADX空趨勢WR中性|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 【空頭趨勢仍有空間】ADX={_adx_v:.1f}空頭有效"
+                                  f"，WR={_wr_v:.1f} 尚未達超賣區(-80)"
+                                  f"，下跌動能未耗盡，暫不宜抄底！", "bear")
+                        new_signals.append(f"ADX空頭WR中性{_wr_v:.0f}")
+
+    except Exception:
+        pass
     if not new_signals or not trigger_ai:
         return
     if not get_groq_key():
