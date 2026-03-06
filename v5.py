@@ -1842,11 +1842,26 @@ def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
     now = datetime.now().strftime("%H:%M:%S")
     key = f"{symbol}|{period}|{msg}"
     if key not in st.session_state.sent_alerts:
+        # ── 衝突偵測：同一 symbol+period 內是否已有反向訊號 ──────────────────
+        conflict_note = ""
+        recent_same = [
+            a for a in st.session_state.alert_log[:10]
+            if a["股票"] == symbol and a["週期"] == period
+        ]
+        if recent_same:
+            opposite = {"bull": "bear", "bear": "bull"}
+            has_opposite = any(a["類型"] == opposite.get(atype) for a in recent_same)
+            if has_opposite:
+                if atype == "bull":
+                    conflict_note = "　⚡【多空分歧】同時存在空頭訊號，短多但中線謹慎，勿重倉！"
+                elif atype == "bear":
+                    conflict_note = "　⚡【多空分歧】同時存在多頭訊號，注意支撐，空單設好止損！"
+        final_msg = msg + conflict_note
         st.session_state.alert_log.insert(0,
-            {"時間": now, "股票": symbol, "週期": period, "訊息": msg, "類型": atype})
+            {"時間": now, "股票": symbol, "週期": period, "訊息": final_msg, "類型": atype})
         st.session_state.alert_log = st.session_state.alert_log[:200]
         st.session_state.sent_alerts.add(key)
-        send_telegram(f"📊 [{symbol} {period}] {msg}")
+        send_telegram(f"📊 [{symbol} {period}] {final_msg}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 數據抓取
